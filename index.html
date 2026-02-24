@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>咕咕鸡大作战 v5.0 - AI 资产管理</title>
+    <title>咕咕鸡大作战 v5.1 - AI 资产管理</title>
     <script src="https://cdn.jsdelivr.net/npm/vue@2.6.14/dist/vue.js"></script>
     <style>
         :root { --primary: #fbc02d; --secondary: #2c3e50; --up: #e74c3c; --down: #27ae60; --bg: #fffdf2; }
@@ -15,23 +15,19 @@
         .header h1 { color: var(--secondary); margin: 0; font-size: 22px; }
         .header h1 span { color: var(--primary); }
 
-        /* 汇总看板 */
         .summary-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
         .stat-item { text-align: center; padding: 5px; }
         .stat-label { font-size: 12px; color: #888; }
         .stat-val { font-size: 20px; font-weight: bold; color: var(--secondary); }
 
-        /* 组合与导航 */
         .tabs { display: flex; gap: 8px; margin-bottom: 12px; overflow-x: auto; padding: 5px 0; scrollbar-width: none; }
         .tab { padding: 6px 16px; background: #eee; border-radius: 18px; cursor: pointer; white-space: nowrap; font-size: 13px; font-weight: bold; }
         .tab.active { background: var(--primary); color: #000; box-shadow: 0 4px 10px rgba(251, 192, 45, 0.3); }
 
-        /* 表格样式 */
         table { width: 100%; border-collapse: collapse; }
         th { text-align: left; font-size: 11px; color: #999; padding: 8px; border-bottom: 2px solid #fff3e0; background: #fffcf5; }
         td { padding: 12px 8px; border-bottom: 1px solid #fff8e1; font-size: 13px; }
         
-        /* AI 配置与操作 */
         .ai-config { background: #fffde7; padding: 10px; border-radius: 8px; margin-bottom: 15px; font-size: 12px; border: 1px dashed #fbc02d; }
         .action-bar { display: flex; gap: 6px; margin-bottom: 10px; flex-wrap: wrap; }
         input { padding: 6px 10px; border: 1px solid #ffe082; border-radius: 6px; width: 85px; font-size: 13px; }
@@ -50,37 +46,36 @@
 
 <div id="app" class="app-container">
     <div class="header">
-        <h1>🐤 <span>咕咕鸡</span>大作战 <small style="font-size: 12px; font-weight: normal; color: #ccc;">v5.0 AI 版</small></h1>
+        <h1>🐤 <span>咕咕鸡</span>大作战 <small style="font-size: 11px; font-weight: normal; color: #ccc;">v5.1 AI 修正版</small></h1>
         <p style="font-size: 11px; color: #999; margin-top: 5px;">{{ status }}</p>
     </div>
 
-    <!-- 1. AI 配置区域 (仅在需要时展开) -->
+    <!-- AI 接口配置 -->
     <div class="card ai-config">
-        <div style="font-weight:bold; margin-bottom:5px;">⚙️ AI 识仓接口配置 (OpenAI 格式)</div>
+        <div style="font-weight:bold; margin-bottom:5px;">⚙️ 智能识仓配置 (Gemini/OpenAI)</div>
         <div style="display:flex; gap:5px; flex-wrap:wrap;">
             <input type="text" v-model="aiConfig.endpoint" placeholder="接口地址" style="width:180px;">
             <input type="password" v-model="aiConfig.key" placeholder="API Key" style="width:140px;">
-            <input type="text" v-model="aiConfig.model" placeholder="模型名(如gpt-4o-mini)" style="width:120px;">
-            <button class="btn" style="background:#eee" @click="saveAIConfig">保存配置</button>
+            <input type="text" v-model="aiConfig.model" placeholder="模型名" style="width:120px;">
+            <button class="btn" style="background:#eee" @click="saveAIConfig">保存</button>
         </div>
-        <div style="margin-top:5px; color:#f9a825; font-size:10px;">* Key 保存在您的本地浏览器，GitHub 无法看到。建议使用 Gemini 或 GPT-4o-mini。</div>
     </div>
 
-    <!-- 2. 总览看板 -->
+    <!-- 资产看板 -->
     <div class="card summary-grid">
         <div class="stat-item" style="border-right: 1px solid #fff3e0;">
             <div class="stat-label">总市值 (元)</div>
             <div class="stat-val">{{ totalAssets.toLocaleString('zh-CN', {minimumFractionDigits: 2}) }}</div>
         </div>
         <div class="stat-item">
-            <div class="stat-label">今日预估收益</div>
+            <div class="stat-label">今日预估盈亏</div>
             <div class="stat-val" :class="totalDayProfit >= 0 ? 'up' : 'down'">
                 {{ totalDayProfit >= 0 ? '+' : '' }}{{ totalDayProfit.toFixed(2) }}
             </div>
         </div>
     </div>
 
-    <!-- 3. 组合导航 -->
+    <!-- 组合导航 -->
     <div class="tabs">
         <div class="tab" :class="{active: currentTab === 'all'}" @click="currentTab = 'all'">全部持仓</div>
         <div class="tab" v-for="(p, index) in portfolios" :class="{active: currentTab === index}" @click="currentTab = index">
@@ -89,28 +84,26 @@
         <div class="tab" @click="addPortfolio" style="background:#fff; border:1px dashed #ccc; color:#999;">+ 新组</div>
     </div>
 
-    <!-- 4. 动态操作区 -->
+    <!-- 操作区 -->
     <div class="card" v-if="currentTab !== 'all'">
         <div class="action-bar">
-            <input type="text" v-model="newFund.code" placeholder="基金代码">
+            <input type="text" v-model="newFund.code" placeholder="代码">
             <input type="number" v-model.number="newFund.shares" placeholder="份额">
-            <input type="number" v-model.number="newFund.cost" placeholder="单位成本">
+            <input type="number" v-model.number="newFund.cost" placeholder="成本">
             <button class="btn btn-add" @click="addFund">手动添加</button>
-            
             <label class="btn btn-ai">
                 📷 智能识仓
                 <input type="file" style="display:none" @change="processAIImage" accept="image/*">
             </label>
-            <button class="btn" style="background:#f5f5f5; color:#999;" @click="removePortfolio">删除组</button>
         </div>
     </div>
 
-    <!-- 5. 数据表格 -->
+    <!-- 表格展示 -->
     <div class="card" style="padding: 10px 5px;">
         <table>
             <thead>
                 <tr>
-                    <th width="28%">基金/代码</th>
+                    <th width="30%">基金/代码</th>
                     <th>昨日净值</th>
                     <th>估值/价格</th>
                     <th>当日涨跌</th>
@@ -132,11 +125,11 @@
                     </td>
                     <td :class="parseFloat(fund.gszzl) >= 0 ? 'up' : 'down'">
                         {{ parseFloat(fund.gszzl) >= 0 ? '+' : '' }}{{ fund.gszzl }}%<br>
-                        <small style="font-weight: normal;">{{ fund.dayProfit >= 0 ? '+' : '' }}{{ fund.dayProfit.toFixed(2) }}</small>
+                        <small>{{ fund.dayProfit >= 0 ? '+' : '' }}{{ fund.dayProfit.toFixed(2) }}</small>
                     </td>
                     <td :class="fund.totalProfit >= 0 ? 'up' : 'down'">
                         {{ fund.totalProfitRate }}%<br>
-                        <small style="font-weight: normal;">{{ fund.totalProfit.toFixed(2) }}</small>
+                        <small>{{ fund.totalProfit.toFixed(2) }}</small>
                         <span v-if="currentTab !== 'all'" class="del-btn" @click="deleteFund(fund.code)">✕</span>
                     </td>
                 </tr>
@@ -145,8 +138,7 @@
     </div>
 
     <div class="footer">
-        <div>&copy; 2026-2028 咕咕鸡大作战 | 版权所有 里昂所有</div>
-        <div style="margin-top:5px; color:#eee;">Data Source: Tiantian/Tencent Cloud</div>
+        &copy; 2026-2028 咕咕鸡大作战 | 版权所有 里昂所有
     </div>
 </div>
 
@@ -158,12 +150,12 @@ new Vue({
         status: '准备就绪',
         newFund: { code: '', shares: null, cost: null },
         aiConfig: JSON.parse(localStorage.getItem('guguji_ai_config')) || {
-            endpoint: 'https://api.openai.com/v1/chat/completions',
+            endpoint: 'https://api.guguji.icu/v1/chat/completions',
             key: '',
-            model: 'gpt-4o-mini'
+            model: 'gemini-2.0-flash'
         },
-        portfolios: JSON.parse(localStorage.getItem('guguji_v50_data')) || [
-            { name: '默认组合', funds: [{code: '161226', shares: 1000, cost: 1.0}] }
+        portfolios: JSON.parse(localStorage.getItem('guguji_v51_data')) || [
+            { name: '默认组合', funds: [{code: '161226', shares: 100, cost: 1.0}] }
         ],
         fundData: {}
     },
@@ -200,7 +192,7 @@ new Vue({
                 const isMarket = /^(1|5|15|16|18|51|58)/.test(code);
                 isMarket ? this.fetchTencent(code) : this.fetchTiantian(code);
             }
-            this.status = "更新于: " + new Date().toLocaleTimeString();
+            this.status = "数据更新于: " + new Date().toLocaleTimeString();
         },
         fetchTencent(code) {
             const fullCode = (code.startsWith('6') || code.startsWith('5')) ? 'sh' + code : 'sz' + code;
@@ -237,79 +229,84 @@ new Vue({
             document.body.appendChild(script);
             setTimeout(() => { if(document.body.contains(script)) document.body.removeChild(script) }, 1000);
         },
-        saveAIConfig() {
-            localStorage.setItem('guguji_ai_config', JSON.stringify(this.aiConfig));
-            alert("配置已保存，仅存放在当前浏览器。");
-        },
+
+        // --- 核心修复：AI 识仓逻辑 ---
         processAIImage(e) {
             const file = e.target.files[0];
-            if (!file || !this.aiConfig.key) return alert("请先配置 API Key");
-            
-            this.status = "正在识别图中持仓...";
+            if (!file || !this.aiConfig.key) return alert("请配置 API Key");
+            if (file.size > 2 * 1024 * 1024) return alert("图片太大了，请压缩到 2MB 以内再上传");
+
+            this.status = "🤖 正在读取截图...";
             const reader = new FileReader();
             reader.onload = async (ev) => {
-                const base64 = ev.target.result.split(',')[1];
-                await this.callVisionAPI(base64);
+                const base64Data = ev.target.result; // 这里的 result 包含了 data:image/xxx;base64 头
+                await this.callVisionAPI(base64Data);
             };
             reader.readAsDataURL(file);
         },
-        async callVisionAPI(base64) {
-            const prompt = "你是一个金融助手。请从截图中提取基金代码（6位）、持有份额、持仓成本。请只返回 JSON 数组格式，不要有描述文字。示例: [{\"code\":\"001186\",\"shares\":1000,\"cost\":1.5}]";
+
+        async callVisionAPI(fullBase64) {
+            this.status = "🧠 AI 正在分析持仓列表...";
+            const prompt = "你是一个金融助手。请识别图中基金的代码（6位数字）、持有份额、单位成本价格。只返回 JSON 数组格式，不要有任何描述文字。示例格式: [{\"code\":\"001186\",\"shares\":1234.56,\"cost\":1.025}]";
+            
             try {
                 const response = await fetch(this.aiConfig.endpoint, {
                     method: 'POST',
-                    headers: { 'Authorization': `Bearer ${this.aiConfig.key}`, 'Content-Type': 'application/json' },
+                    headers: { 
+                        'Authorization': `Bearer ${this.aiConfig.key}`,
+                        'Content-Type': 'application/json' 
+                    },
                     body: JSON.stringify({
                         model: this.aiConfig.model,
-                        messages: [{ role: "user", content: [
-                            { type: "text", text: prompt },
-                            { type: "image_url", image_url: { url: `data:image/jpeg;base64,${base64}` } }
-                        ]}]
+                        messages: [{ 
+                            role: "user", 
+                            content: [
+                                { type: "text", text: prompt },
+                                { type: "image_url", image_url: { url: fullBase64 } }
+                            ]
+                        }],
+                        temperature: 0.1
                     })
                 });
+
                 const res = await response.json();
-                const jsonStr = res.choices[0].message.content.replace(/```json|```/g, '').trim();
+
+                if (!response.ok) {
+                    console.error("API Error Detail:", res);
+                    throw new Error(res.error?.message || `服务器返回错误 ${response.status}`);
+                }
+
+                if (!res.choices || !res.choices[0]) throw new Error("AI 未返回有效内容");
+
+                let jsonStr = res.choices[0].message.content;
+                // 清理 Markdown 标签
+                jsonStr = jsonStr.replace(/```json/g, '').replace(/```/g, '').trim();
+                
                 const funds = JSON.parse(jsonStr);
+                if (!Array.isArray(funds)) throw new Error("解析出的格式不是数组");
+
                 funds.forEach(f => {
-                    this.portfolios[this.currentTab].funds.push({ code: f.code, shares: f.shares, cost: f.cost });
+                    let c = f.code.toString();
+                    while(c.length < 6) c = '0' + c;
+                    this.portfolios[this.currentTab].funds.push({
+                        code: c,
+                        shares: parseFloat(f.shares) || 0,
+                        cost: parseFloat(f.cost) || 0
+                    });
                 });
+
                 this.save();
                 this.refreshAll();
-                this.status = "识别成功，已导入";
+                this.status = `✅ 识别成功，导入了 ${funds.length} 只基金`;
             } catch (err) {
-                this.status = "识别失败，请检查网络或配置";
-                console.error(err);
+                this.status = "❌ 识别失败：" + err.message;
+                console.error("Full AI Error:", err);
             }
         },
+
+        saveAIConfig() {
+            localStorage.setItem('guguji_ai_config', JSON.stringify(this.aiConfig));
+            alert("AI 配置已保存至本地。");
+        },
         addPortfolio() {
-            const name = prompt("组合名称");
-            if(name) { this.portfolios.push({ name, funds: [] }); this.save(); }
-        },
-        removePortfolio() {
-            if(confirm("确定删除吗？")) { this.portfolios.splice(this.currentTab, 1); this.currentTab = 'all'; this.save(); }
-        },
-        addFund() {
-            if(!this.newFund.code) return;
-            let c = this.newFund.code.trim();
-            while(c.length < 6) c = '0' + c;
-            this.portfolios[this.currentTab].funds.push({ code: c, shares: this.newFund.shares || 0, cost: this.newFund.cost || 0 });
-            this.newFund = { code: '', shares: null, cost: null };
-            this.save();
-            this.refreshAll();
-        },
-        deleteFund(code) {
-            this.portfolios[this.currentTab].funds = this.portfolios[this.currentTab].funds.filter(f => f.code !== code);
-            this.save();
-        },
-        save() {
-            localStorage.setItem('guguji_v50_data', JSON.stringify(this.portfolios));
-        }
-    },
-    mounted() {
-        this.refreshAll();
-        setInterval(this.refreshAll, 60000);
-    }
-});
-</script>
-</body>
-</html>
+            con

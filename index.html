@@ -3,70 +3,62 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>咕咕鸡大作战 v5.1.2</title>
-    <!-- 国内稳定 CDN -->
+    <title>咕咕鸡大作战 v5.2.6 - 专业资产看板</title>
+    <!-- 国内极速 CDN -->
     <script src="https://lib.baomitu.com/vue/2.6.14/vue.min.js"></script>
+    <script src="https://lib.baomitu.com/xlsx/0.17.0/xlsx.full.min.js"></script>
     <style>
         :root { --primary: #fbc02d; --secondary: #2c3e50; --up: #e74c3c; --down: #27ae60; --bg: #fffdf2; }
-        body { font-family: "PingFang SC", "Microsoft YaHei", sans-serif; background: var(--bg); margin: 0; padding: 10px; color: #333; }
+        body { font-family: "PingFang SC", sans-serif; background: var(--bg); margin: 0; padding: 10px; color: #333; }
         [v-cloak] { display: none; }
         .app-container { max-width: 1000px; margin: 0 auto; padding-bottom: 60px; }
-        .card { background: white; border-radius: 16px; padding: 15px; box-shadow: 0 8px 20px rgba(251, 192, 45, 0.1); margin-bottom: 15px; border: 1px solid #ffecb3; }
+        .card { background: white; border-radius: 16px; padding: 15px; box-shadow: 0 8px 20px rgba(251,192,45,0.1); margin-bottom: 15px; border: 1px solid #ffecb3; }
         .header { text-align: center; margin-bottom: 15px; }
         .header h1 { color: var(--secondary); margin: 0; font-size: 22px; }
-        .header h1 span { color: var(--primary); }
-        .summary-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
-        .stat-item { text-align: center; padding: 5px; }
-        .stat-label { font-size: 12px; color: #888; }
-        .stat-val { font-size: 20px; font-weight: bold; color: var(--secondary); }
-        .tabs { display: flex; gap: 8px; margin-bottom: 12px; overflow-x: auto; padding: 5px 0; scrollbar-width: none; }
+        .summary-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+        .stat-item { text-align: center; border-right: 1px solid #fff3e0; }
+        .stat-item:last-child { border-right: none; }
+        .stat-label { font-size: 11px; color: #888; }
+        .stat-val { font-size: 15px; font-weight: bold; color: var(--secondary); }
+        .tabs { display: flex; gap: 8px; margin-bottom: 12px; overflow-x: auto; scrollbar-width: none; }
         .tab { padding: 6px 16px; background: #eee; border-radius: 18px; cursor: pointer; white-space: nowrap; font-size: 13px; font-weight: bold; }
-        .tab.active { background: var(--primary); color: #000; box-shadow: 0 4px 10px rgba(251, 192, 45, 0.3); }
+        .tab.active { background: var(--primary); color: #000; }
         table { width: 100%; border-collapse: collapse; }
-        th { text-align: left; font-size: 11px; color: #999; padding: 8px; border-bottom: 2px solid #fff3e0; background: #fffcf5; }
-        td { padding: 12px 8px; border-bottom: 1px solid #fff8e1; font-size: 13px; }
-        .ai-config { background: #fffde7; padding: 10px; border-radius: 8px; margin-bottom: 15px; font-size: 12px; border: 1px dashed #fbc02d; }
-        .action-bar { display: flex; gap: 6px; margin-bottom: 10px; flex-wrap: wrap; }
-        input { padding: 6px 10px; border: 1px solid #ffe082; border-radius: 6px; width: 85px; font-size: 13px; }
-        .btn { padding: 6px 12px; border-radius: 6px; border: none; cursor: pointer; font-weight: bold; font-size: 12px; }
-        .btn-add { background: var(--secondary); color: white; }
-        .btn-ai { background: #673ab7; color: white; }
+        th { text-align: left; font-size: 10px; color: #999; padding: 8px; border-bottom: 2px solid #fff3e0; background: #fffcf5; }
+        td { padding: 12px 8px; border-bottom: 1px solid #fff8e1; font-size: 12px; }
         .up { color: var(--up); font-weight: bold; }
         .down { color: var(--down); font-weight: bold; }
-        .date-text { font-size: 10px; color: #bbb; display: block; }
-        .footer { text-align: center; padding: 30px; font-size: 11px; color: #bbb; }
-        .del-btn { color: #ddd; cursor: pointer; font-size: 16px; margin-left: 4px; }
+        .date-text { font-size: 9px; color: #aaa; display: block; margin-top: 2px; }
+        .source-tag { font-size: 8px; padding: 1px 3px; background: #f0f0f0; color: #aaa; border-radius: 3px; }
+        .btn { padding: 6px 12px; border-radius: 6px; border: none; cursor: pointer; font-weight: bold; font-size: 11px; display: inline-flex; align-items: center; gap: 4px; }
+        .btn-add { background: var(--secondary); color: white; }
+        .btn-excel { background: #2e7d32; color: white; }
     </style>
 </head>
 <body>
 
 <div id="app" class="app-container" v-cloak>
     <div class="header">
-        <h1>🐤 <span>咕咕鸡</span>大作战 <small style="font-size: 11px; font-weight: normal; color: #ccc;">v5.1.2</small></h1>
-        <p style="font-size: 11px; color: #999; margin-top: 5px;">{{ status }}</p>
-    </div>
-
-    <!-- AI 配置 -->
-    <div class="card ai-config">
-        <div style="font-weight:bold; margin-bottom:5px;">⚙️ AI 识仓配置 (Gemini/OpenAI)</div>
-        <div style="display:flex; gap:5px; flex-wrap:wrap;">
-            <input type="text" v-model="aiConfig.endpoint" placeholder="接口地址" style="width:180px;">
-            <input type="password" v-model="aiConfig.key" placeholder="API Key" style="width:140px;">
-            <input type="text" v-model="aiConfig.model" placeholder="模型名" style="width:120px;">
-            <button class="btn" style="background:#eee" @click="saveAIConfig">保存配置</button>
-        </div>
+        <h1>🐤 <span>咕咕鸡</span>大作战 <small style="font-size: 11px; color: #ccc;">v5.2.6</small></h1>
+        <p style="font-size: 11px; color: #999;">状态: {{ status }}</p>
     </div>
 
     <!-- 看板 -->
     <div class="card summary-grid">
-        <div class="stat-item" style="border-right: 1px solid #fff3e0;">
-            <div class="stat-label">总市值 (元)</div>
+        <div class="stat-item">
+            <div class="stat-label">总资产</div>
             <div class="stat-val">{{ totalAssets.toLocaleString('zh-CN', {minimumFractionDigits: 2}) }}</div>
         </div>
         <div class="stat-item">
             <div class="stat-label">今日预估盈亏</div>
             <div class="stat-val" :class="totalDayProfit >= 0 ? 'up' : 'down'">
                 {{ totalDayProfit >= 0 ? '+' : '' }}{{ totalDayProfit.toFixed(2) }}
+            </div>
+        </div>
+        <div class="stat-item">
+            <div class="stat-label">累计总收益</div>
+            <div class="stat-val" :class="overallProfit >= 0 ? 'up' : 'down'">
+                {{ overallProfit >= 0 ? '+' : '' }}{{ overallProfit.toFixed(2) }}
             </div>
         </div>
     </div>
@@ -77,254 +69,48 @@
         <div class="tab" v-for="(p, index) in portfolios" :key="index" :class="{active: currentTab === index}" @click="currentTab = index">
             {{ p.name }}
         </div>
-        <div class="tab" @click="addPortfolio" style="background:#fff; border:1px dashed #ccc; color:#999;">+ 新组</div>
+        <div class="tab" @click="addPortfolio" style="background:#fff; border:1px dashed #ccc;">+</div>
     </div>
 
-    <!-- 操作 -->
+    <!-- 操作区 -->
     <div class="card" v-if="currentTab !== 'all'">
-        <div class="action-bar">
-            <input type="text" v-model="newFund.code" placeholder="代码">
-            <input type="number" v-model.number="newFund.shares" placeholder="份额">
-            <input type="number" v-model.number="newFund.cost" placeholder="成本">
+        <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+            <input style="padding:6px; border:1px solid #ffe082; border-radius:6px; width:75px;" type="text" v-model="newFund.code" placeholder="代码">
+            <input style="padding:6px; border:1px solid #ffe082; border-radius:6px; width:75px;" type="number" v-model.number="newFund.shares" placeholder="份额">
+            <input style="padding:6px; border:1px solid #ffe082; border-radius:6px; width:75px;" type="number" v-model.number="newFund.cost" placeholder="成本价">
             <button class="btn btn-add" @click="addFund">手动添加</button>
-            <label class="btn btn-ai">
-                📷 智能识仓
-                <input type="file" style="display:none" @change="processAIImage" accept="image/*">
+            
+            <div style="height:20px; width:1px; background:#eee; margin: 0 5px;"></div>
+            
+            <!-- Excel 导入按钮 -->
+            <label class="btn btn-excel">
+                📊 导入 Excel
+                <input type="file" style="display:none" @change="importExcel" accept=".xlsx, .xls">
             </label>
+            <button class="btn" style="background:#fff; border:1px solid #ddd;" @click="downloadTemplate">📑 模板</button>
+            
+            <button class="btn" style="background:#f5f5f5; color:#999; margin-left: auto;" @click="removePortfolio">删除组</button>
         </div>
     </div>
 
-    <!-- 列表 -->
+    <!-- 数据表格 -->
     <div class="card" style="padding: 10px 5px;">
         <table>
             <thead>
                 <tr>
-                    <th width="30%">基金/代码</th>
-                    <th>昨日净值</th>
-                    <th>估值/价格</th>
-                    <th>当日涨跌</th>
-                    <th>累计盈亏</th>
+                    <th width="32%">基金名称/代码</th>
+                    <th width="22%">昨日确认基准</th>
+                    <th width="22%">今日最新估值</th>
+                    <th width="24%">当日/累计收益</th>
                 </tr>
             </thead>
             <tbody>
                 <tr v-for="(fund, index) in displayedFunds" :key="fund.code + index">
                     <td>
                         <div style="font-weight:bold; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 140px;">
-                            {{ fund.name || '加载中...' }}
+                            {{ fund.name || '识别中...' }}
                         </div>
-                        <div style="font-size:10px; color:#bbb;">{{ fund.code }}</div>
+                        <div style="font-size:10px; color:#bbb;">{{ fund.code }} <span class="source-tag">{{ fund.source }}</span></div>
                     </td>
-                    <td style="color:#666;">{{ fund.dwjz || '--' }}</td>
                     <td>
-                        <div style="font-weight: bold;">{{ fund.gsz || '--' }}</div>
-                        <span class="date-text">{{ fund.date || '--' }}</span>
-                    </td>
-                    <td :class="parseFloat(fund.gszzl) >= 0 ? 'up' : 'down'">
-                        {{ parseFloat(fund.gszzl) >= 0 ? '+' : '' }}{{ fund.gszzl }}%<br>
-                        <small>{{ fund.dayProfit >= 0 ? '+' : '' }}{{ fund.dayProfit.toFixed(2) }}</small>
-                    </td>
-                    <td :class="fund.totalProfit >= 0 ? 'up' : 'down'">
-                        {{ fund.totalProfitRate }}%<br>
-                        <small>{{ fund.totalProfit.toFixed(2) }}</small>
-                        <span v-if="currentTab !== 'all'" class="del-btn" @click="deleteFund(fund.code)">✕</span>
-                    </td>
-                </tr>
-            </tbody>
-        </table>
-    </div>
-
-    <div class="footer">
-        &copy; 2026-2028 咕咕鸡大作战 | 版权所有 里昂所有
-    </div>
-</div>
-
-<script>
-window.onload = function() {
-    new Vue({
-        el: '#app',
-        data: {
-            currentTab: 'all',
-            status: '系统就绪',
-            newFund: { code: '', shares: null, cost: null },
-            aiConfig: JSON.parse(localStorage.getItem('guguji_ai_config')) || {
-                endpoint: 'https://api.guguji.icu/v1/chat/completions',
-                key: '',
-                model: 'gemini-2.0-flash'
-            },
-            portfolios: JSON.parse(localStorage.getItem('guguji_v512_data')) || [
-                { name: '默认组合', funds: [{code: '161226', shares: 100, cost: 1.0}] }
-            ],
-            fundData: {}
-        },
-        computed: {
-            displayedFunds() {
-                let list = [];
-                if (this.currentTab === 'all') {
-                    this.portfolios.forEach(p => list = list.concat(p.funds || []));
-                } else {
-                    list = (this.portfolios[this.currentTab] || {funds:[]}).funds;
-                }
-                return list.map(f => {
-                    const info = this.fundData[f.code] || {};
-                    const gsz = parseFloat(info.gsz || 0);
-                    const dwjz = parseFloat(info.dwjz || 0);
-                    const dayProfit = f.shares * (gsz - dwjz);
-                    const totalProfit = f.shares * (gsz - f.cost);
-                    const totalProfitRate = (f.cost > 0) ? ((totalProfit / (f.cost * f.shares)) * 100).toFixed(2) : '0.00';
-                    return { ...f, ...info, dayProfit, totalProfit, totalProfitRate };
-                });
-            },
-            totalAssets() {
-                return this.displayedFunds.reduce((sum, f) => sum + (f.shares * (parseFloat(this.fundData[f.code]?.gsz) || f.cost)), 0);
-            },
-            totalDayProfit() {
-                return this.displayedFunds.reduce((sum, f) => sum + (parseFloat(f.dayProfit) || 0), 0);
-            }
-        },
-        methods: {
-            async refreshAll() {
-                const codes = new Set();
-                this.portfolios.forEach(p => p.funds && p.funds.forEach(f => codes.add(f.code)));
-                for (let code of codes) {
-                    const isMarket = /^(1|5|15|16|18|51|58)/.test(code);
-                    isMarket ? this.fetchTencent(code) : this.fetchTiantian(code);
-                }
-                this.status = "更新于: " + new Date().toLocaleTimeString();
-            },
-            fetchTencent(code) {
-                const fullCode = (code.startsWith('6') || code.startsWith('5')) ? 'sh' + code : 'sz' + code;
-                const script = document.createElement('script');
-                script.charset = "gbk";
-                script.src = `https://qt.gtimg.cn/q=${fullCode}`;
-                script.onload = () => {
-                    const val = window['v_' + fullCode];
-                    if (val) {
-                        const d = val.split('~');
-                        this.$set(this.fundData, code, {
-                            name: d[1], gsz: d[3], dwjz: d[4], gszzl: d[32],
-                            date: d[30] ? d[30].substring(4,6)+'-'+d[30].substring(6,8) : '--'
-                        });
-                    }
-                    document.body.removeChild(script);
-                };
-                document.body.appendChild(script);
-            },
-            fetchTiantian(code) {
-                window.jsonpgz = (data) => {
-                    if(data && data.fundcode) {
-                        this.$set(this.fundData, data.fundcode, {
-                            name: data.name, gsz: data.gsz, dwjz: data.dwjz, gszzl: data.gszzl,
-                            date: data.gztime ? data.gztime.substring(5, 10) : '--'
-                        });
-                    }
-                };
-                const script = document.createElement('script');
-                script.src = `https://fundgz.1234567.com.cn/js/${code}.js?rt=${Date.now()}`;
-                document.body.appendChild(script);
-                setTimeout(() => { if(document.body.contains(script)) document.body.removeChild(script) }, 1000);
-            },
-            processAIImage(e) {
-                const file = e.target.files[0];
-                if (!file || !this.aiConfig.key) return alert("请先配置 API Key");
-                this.status = "正在读取图片...";
-                const reader = new FileReader();
-                reader.onload = async (ev) => {
-                    await this.callVisionAPI(ev.target.result);
-                };
-                reader.readAsDataURL(file);
-            },
-            // --- 核心更新：callVisionAPI 增加错误诊断 ---
-            async callVisionAPI(fullBase64) {
-                this.status = "🧠 AI 正在分析持仓...";
-                const prompt = "你是一个金融助手。请识别图中基金的代码（6位）、份额、成本价。只返回JSON数组，不要有文字。示例: [{\"code\":\"001186\",\"shares\":1000,\"cost\":1.5}]";
-                
-                try {
-                    const response = await fetch(this.aiConfig.endpoint, {
-                        method: 'POST',
-                        headers: { 
-                            'Authorization': 'Bearer ' + this.aiConfig.key, 
-                            'Content-Type': 'application/json' 
-                        },
-                        body: JSON.stringify({
-                            model: this.aiConfig.model,
-                            messages: [{ role: "user", content: [
-                                { type: "text", text: prompt },
-                                { type: "image_url", image_url: { url: fullBase64 } }
-                            ]}]
-                        })
-                    });
-
-                    // 1. 先将响应转为文本，防止解析空数据报错
-                    const responseText = await response.text();
-                    let res;
-                    try {
-                        res = JSON.parse(responseText);
-                    } catch (e) {
-                        console.error("无法解析 JSON. 原始内容:", responseText);
-                        throw new Error("接口返回内容格式异常，请查看控制台 F12");
-                    }
-
-                    // 2. 检查 HTTP 状态码
-                    if (!response.ok) {
-                        console.error("API 报错详情:", res);
-                        throw new Error(res.error?.message || `服务器返回错误 ${response.status}`);
-                    }
-
-                    // 3. 提取结果
-                    let jsonStr = res.choices[0].message.content;
-                    jsonStr = jsonStr.replace(/```json/g, '').replace(/```/g, '').trim();
-                    
-                    const funds = JSON.parse(jsonStr);
-                    funds.forEach(f => {
-                        let c = f.code.toString();
-                        while(c.length < 6) c = '0' + c;
-                        this.portfolios[this.currentTab].funds.push({
-                            code: c, shares: parseFloat(f.shares) || 0, cost: parseFloat(f.cost) || 0
-                        });
-                    });
-
-                    this.save(); this.refreshAll();
-                    this.status = `✅ 识别成功，导入了 ${funds.length} 只基金`;
-                } catch (err) {
-                    this.status = "❌ 失败：" + err.message;
-                    console.error("AI 识别错误详情:", err);
-                }
-            },
-            saveAIConfig() {
-                localStorage.setItem('guguji_ai_config', JSON.stringify(this.aiConfig));
-                alert("配置已成功保存！");
-            },
-            addPortfolio() {
-                const name = prompt("组合名称");
-                if(name) { this.portfolios.push({ name, funds: [] }); this.save(); }
-            },
-            removePortfolio() {
-                if(confirm("确定删除吗？")) { this.portfolios.splice(this.currentTab, 1); this.currentTab = 'all'; this.save(); }
-            },
-            addFund() {
-                if(!this.newFund.code) return;
-                let c = this.newFund.code.trim();
-                while(c.length < 6) c = '0' + c;
-                this.portfolios[this.currentTab].funds.push({ 
-                    code: c, shares: this.newFund.shares || 0, cost: this.newFund.cost || 0 
-                });
-                this.newFund = { code: '', shares: null, cost: null };
-                this.save(); this.refreshAll();
-            },
-            deleteFund(code) {
-                this.portfolios[this.currentTab].funds = this.portfolios[this.currentTab].funds.filter(f => f.code !== code);
-                this.save();
-            },
-            save() {
-                localStorage.setItem('guguji_v512_data', JSON.stringify(this.portfolios));
-            }
-        },
-        mounted() {
-            this.refreshAll();
-            setInterval(this.refreshAll, 60000);
-        }
-    });
-};
-</script>
-</body>
-</html>
+                        <div style="font-weight: bold; color: #666;">{{ fund.basePrice || '--' }}</div>

@@ -309,4 +309,34 @@ new Vue({
             alert("AI 配置已保存至本地。");
         },
         addPortfolio() {
-            con
+            const name = prompt("组合名称");
+            if(name) { this.portfolios.push({ name, funds: [] }); this.save(); }
+        },
+        removePortfolio() {
+            if(confirm("确定删除吗？")) { this.portfolios.splice(this.currentTab, 1); this.currentTab = 'all'; this.save(); }
+        },
+        addFund() {
+            if(!this.newFund.code) return;
+            let c = this.newFund.code.trim();
+            while(c.length < 6) c = '0' + c;
+            this.portfolios[this.currentTab].funds.push({ code: c, shares: this.newFund.shares || 0, cost: this.newFund.cost || 0 });
+            this.newFund = { code: '', shares: null, cost: null };
+            this.save();
+            this.refreshAll();
+        },
+        deleteFund(code) {
+            this.portfolios[this.currentTab].funds = this.portfolios[this.currentTab].funds.filter(f => f.code !== code);
+            this.save();
+        },
+        save() {
+            localStorage.setItem('guguji_v51_data', JSON.stringify(this.portfolios));
+        }
+    },
+    mounted() {
+        this.refreshAll();
+        setInterval(this.refreshAll, 60000);
+    }
+});
+</script>
+</body>
+</html>

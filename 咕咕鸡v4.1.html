@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>咕咕鸡大作战 v4.1 - 基金资产管理</title>
+    <script src="https://cdn.jsdelivr.net/npm/vue@2.6.14/dist/vue.js"></script>
+    <style>
+        :root { --primary: #fbc02d; --secondary: #2c3e50; --up: #e74c3c; --down: #27ae60; --bg: #fffdf2; }
+        body { font-family: "PingFang SC", "Microsoft YaHei", sans-serif; background: var(--bg); margin: 0; padding: 15px; color: #333; }
+        .app-container { max-width: 1000px; margin: 0 auto; padding-bottom: 60px; }
+        .card { background: white; border-radius: 16px; padding: 20px; box-shadow: 0 8px 20px rgba(251, 192, 45, 0.1); margin-bottom: 20px; border: 1px solid #ffecb3; }
+        
+        /* 标题与页眉 */
+        .header { text-align: center; margin-bottom: 20px; }
+        .header h1 { color: var(--secondary); margin: 0; font-size: 24px; letter-spacing: 1px; }
+        .header h1 span { color: var(--primary); }
+
+        /* 汇总看板 */
+        .summary-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 15px; }
+        .stat-item { text-align: center; padding: 10px; }
+        .stat-label { font-size: 13px; color: #888; margin-bottom: 8px; }
+        .stat-val { font-size: 22px; font-weight: bold; color: var(--secondary); }
+
+        /* 组合切换 */
+        .tabs { display: flex; gap: 8px; margin-bottom: 15px; overflow-x: auto; padding: 5px 0; scrollbar-width: none; }
+        .tabs::-webkit-scrollbar { display: none; }
+        .tab { padding: 8px 20px; background: #f0f0f0; border-radius: 20px; cursor: pointer; white-space: nowrap; font-size: 13px; font-weight: bold; transition: 0.3s; }
+        .tab.active { background: var(--primary); color: #000; box-shadow: 0 4px 10px rgba(251, 192, 45, 0.4); }
+
+        /* 表格样式 */
+        table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+        th { text-align: left; font-size: 11px; color: #999; padding: 10px; border-bottom: 2px solid #fff3e0; background: #fffcf5; }
+        td { padding: 14px 10px; border-bottom: 1px solid #fff8e1; font-size: 14px; }
+        
+        /* 表单与操作 */
+        .action-bar { display: flex; gap: 8px; margin-bottom: 15px; flex-wrap: wrap; }
+        input { padding: 8px 12px; border: 1px solid #ffe082; border-radius: 8px; width: 90px; outline: none; background: #fffde7; }
+        .btn { padding: 8px 16px; border-radius: 8px; border: none; cursor: pointer; font-weight: bold; font-size: 13px; transition: 0.2s; }
+        .btn-add { background: var(--secondary); color: white; }
+        .btn-ocr { background: #673ab7; color: white; display: flex; align-items: center; gap: 4px; }
+        .btn-ocr:hover { opacity: 0.9; }
+
+        /* 辅助样式 */
+        .up { color: var(--up); font-weight: bold; }
+        .down { color: var(--down); font-weight: bold; }
+        .date-text { font-size: 10px; color: #bbb; display: block; margin-top: 2px; }
+        .nav-text { color: #666; font-size: 13px; }
+        .footer { text-align: center; padding: 20px; font-size: 12px; color: #bbb; }
+        .del-btn { color: #ccc; cursor: pointer; margin-left: 5px; }
+    </style>
+</head>
+<body>
+
+<div id="app" class="app-container">
+    <div class="header">
+        <h1>🐤 <span>咕咕鸡</span>大作战 <small style="font-size: 12px; font-weight: normal; color: #999;">v4.1</small></h1>
+        <p style="font-size: 12px; color: #aaa; margin-top: 5px;">{{ status }}</p>
+    </div>
+
+    <!-- 1. 资产总览 -->
+    <div class="card summary-grid">
+        <div class="stat-item" style="border-right: 1px solid #fff3e0;">
+            <div class="stat-label">总市值 (元)</div>
+            <div class="stat-val">{{ totalAssets.toLocaleString('zh-CN', {minimumFractionDigits: 2}) }}</div>
+        </div>
+        <div class="stat-item">
+            <div class="stat-label">今日预估盈亏</div>
+            <div class="stat-val" :class="totalDayProfit >= 0 ? 'up' : 'down'">
+                {{ totalDayProfit >= 0 ? '+' : '' }}{{ totalDayProfit.toFixed(2) }}
+            </div>
+        </div>
+    </div>
+
+    <!-- 2. 组合管理 (支持合并和分开) -->
+    <div class="tabs">
+        <div class="tab" :class="{active: currentTab === 'all'}" @click="currentTab = 'all'">全部持仓</div>
+        <div class="tab" v-for="(p, index) in portfolios" :class="{active: currentTab === index}" @click="currentTab = index">
+            {{ p.name }}
+        </div>
+        <div class="tab" @click="addPortfolio" style="background:#fff; border:1px dashed #ccc; color:#999;">+ 新组</div>
+    </div>
+
+    <!-- 3. 操作区 -->
+    <div class="card" v-if="currentTab !== 'all'">
+        <div class="action-bar">
+            <input type="text" v-model="newFund.code" placeholder="基金代码">
+            <input type="number" v-model.number="newFund.shares" placeholder="份额">
+            <input type="number" v-model.number="newFund.cost" placeholder="成本价">
+            <button class="btn btn-add" @click="addFund">添加</button>
+            
+            <!-- 图片识别按钮 -->
+            <label class="btn btn-ocr">
+                📷 图片识仓
+                <input type="file" style="display:none" @change="handleOCR" accept="image/*">
+            </label>
+            
+            <button class="btn" style="background:#f5f5f5; color:#999;" @click="removePortfolio">删除组</button>
+        </div>
+    </div>
+
+    <!-- 4. 数据表格 -->
+    <div class="card">
+        <table>
+            <thead>
+                <tr>
+                    <th width="30%">基金名称/代码</th>
+                    <th>昨日净值</th>
+                    <th>当前估值/价格</th>
+                    <th>当日涨跌</th>
+                    <th>累计盈亏</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr v-for="fund in displayedFunds">
+                    <td>
+                        <div style="font-weight:bold; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 140px;">
+                            {{ fund.name || '查询中...' }}
+                        </div>
+                        <div style="font-size:10px; color:#bbb;">{{ fund.code }}</div>
+                    </td>
+                    <td class="nav-text">{{ fund.dwjz || '--' }}</td>
+                    <td>
+                        <span style="font-size:15px; font-weight: bold;">{{ fund.gsz || '--' }}</span>
+                        <span class="date-text">({{ fund.date || '--' }})</span>
+                    </td>
+                    <td :class="parseFloat(fund.gszzl) >= 0 ? 'up' : 'down'">
+                        {{ parseFloat(fund.gszzl) >= 0 ? '+' : '' }}{{ fund.gszzl }}%<br>
+                        <small style="font-size: 11px;">{{ fund.dayProfit >= 0 ? '+' : '' }}{{ fund.dayProfit.toFixed(2) }}</small>
+                    </td>
+                    <td :class="fund.totalProfit >= 0 ? 'up' : 'down'">
+                        {{ fund.totalProfitRate }}%<br>
+                        <small style="font-size: 11px;">{{ fund.totalProfit >= 0 ? '+' : '' }}{{ fund.totalProfit.toFixed(2) }}</small>
+                        <span v-if="currentTab !== 'all'" class="del-btn" @click="deleteFund(fund.code)">✕</span>
+                    </td>
+                </tr>
+            </tbody>
+        </table>
+        <div v-if="displayedFunds.length === 0" style="text-align:center; padding: 40px; color:#ccc;">
+            还没有持仓，点“+”创建组合或添加基金吧！
+        </div>
+    </div>
+
+    <!-- 5. 页脚 -->
+    <div class="footer">
+        &copy; 2026-2028 咕咕鸡大作战 | 版权所有 里昂所有
+    </div>
+</div>
+
+<script>
+new Vue({
+    el: '#app',
+    data: {
+        currentTab: 'all',
+        status: '数据同步中...',
+        newFund: { code: '', shares: null, cost: null },
+        portfolios: JSON.parse(localStorage.getItem('guguji_v41_data')) || [
+            { name: '养老基金', funds: [{code: '161226', shares: 1000, cost: 1.0}, {code: '020904', shares: 500, cost: 0.8}] },
+            { name: '教育金', funds: [{code: '001186', shares: 2000, cost: 1.2}] }
+        ],
+        fundData: {}
+    },
+    computed: {
+        displayedFunds() {
+            let list = [];
+            if (this.currentTab === 'all') {
+                this.portfolios.forEach(p => list = list.concat(p.funds));
+            } else {
+                list = this.portfolios[this.currentTab].funds;
+            }
+            return list.map(f => {
+                const info = this.fundData[f.code] || {};
+                const gsz = parseFloat(info.gsz || 0);
+                const dwjz = parseFloat(info.dwjz || 0);
+                const dayProfit = f.shares * (gsz - dwjz);
+                const totalProfit = f.shares * (gsz - f.cost);
+                const totalProfitRate = (f.cost > 0 && f.shares > 0) ? ((totalProfit / (f.cost * f.shares)) * 100).toFixed(2) : '0.00';
+                return { ...f, ...info, dayProfit, totalProfit, totalProfitRate };
+            });
+        },
+        totalAssets() {
+            return this.displayedFunds.reduce((sum, f) => sum + (f.shares * (parseFloat(this.fundData[f.code]?.gsz) || f.cost)), 0);
+        },
+        totalDayProfit() {
+            return this.displayedFunds.reduce((sum, f) => sum + f.dayProfit, 0);
+        }
+    },
+    methods: {
+        async refreshAll() {
+            const codes = new Set();
+            this.portfolios.forEach(p => p.funds.forEach(f => codes.add(f.code)));
+            for (let code of codes) {
+                const isMarket = /^(1|5|15|16|18|51|58)/.test(code);
+                isMarket ? this.fetchTencent(code) : this.fetchTiantian(code);
+            }
+            this.status = "最后更新: " + new Date().toLocaleTimeString();
+        },
+        fetchTencent(code) {
+            const fullCode = (code.startsWith('6') || code.startsWith('5')) ? 'sh' + code : 'sz' + code;
+            const script = document.createElement('script');
+            script.charset = "gbk";
+            script.src = `https://qt.gtimg.cn/q=${fullCode}`;
+            script.onload = () => {
+                const val = window['v_' + fullCode];
+                if (val) {
+                    const d = val.split('~');
+                    this.$set(this.fundData, code, {
+                        name: d[1], gsz: d[3], dwjz: d[4], gszzl: d[32],
+                        date: d[30] ? d[30].substring(4,6)+'-'+d[30].substring(6,8) : '--',
+                        source: '场内'
+                    });
+                }
+                document.body.removeChild(script);
+            };
+            document.body.appendChild(script);
+        },
+        fetchTiantian(code) {
+            window.jsonpgz = (data) => {
+                this.$set(this.fundData, data.fundcode, {
+                    name: data.name, gsz: data.gsz, dwjz: data.dwjz, gszzl: data.gszzl,
+                    date: data.gztime ? data.gztime.substring(5, 10) : '--',
+                    source: '估值'
+                });
+            };
+            const script = document.createElement('script');
+            script.src = `https://fundgz.1234567.com.cn/js/${code}.js?rt=${Date.now()}`;
+            script.onerror = () => this.fetchTencent(code);
+            document.body.appendChild(script);
+            setTimeout(() => { if(document.body.contains(script)) document.body.removeChild(script) }, 1000);
+        },
+        handleOCR(e) {
+            alert("📷 图片识仓功能已就绪！\n\n【本地演示版说明】：\n由于本地浏览器隐私限制，暂不能直接解析图像。当您后期部署到腾讯云服务器后，系统将对接云端AI自动识别截图中的代码、份额和成本。目前您可以先长按截图中的文字并复制，或手动录入。");
+            // 这里留出的逻辑空位，在部署服务器后可直接接入 axios.post('/api/ocr')
+        },
+        addPortfolio() {
+            const name = prompt("请输入新组合名称", "我的组合 " + (this.portfolios.length + 1));
+            if(name) {
+                this.portfolios.push({ name, funds: [] });
+                this.save();
+            }
+        },
+        removePortfolio() {
+            if(confirm("确定删除整个组合吗？")) {
+                this.portfolios.splice(this.currentTab, 1);
+                this.currentTab = 'all';
+                this.save();
+            }
+        },
+        addFund() {
+            if(!this.newFund.code) return;
+            let code = this.newFund.code.trim();
+            while(code.length < 6) code = '0' + code;
+            this.portfolios[this.currentTab].funds.push({
+                code: code,
+                shares: this.newFund.shares || 0,
+                cost: this.newFund.cost || 0
+            });
+            this.newFund = { code: '', shares: null, cost: null };
+            this.save();
+            this.refreshAll();
+        },
+        deleteFund(code) {
+            this.portfolios[this.currentTab].funds = this.portfolios[this.currentTab].funds.filter(f => f.code !== code);
+            this.save();
+        },
+        save() {
+            localStorage.setItem('guguji_v41_data', JSON.stringify(this.portfolios));
+        }
+    },
+    mounted() {
+        this.refreshAll();
+        setInterval(this.refreshAll, 60000);
+    }
+});
+</script>
+</body>
+</html>

@@ -3,7 +3,8 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>咕咕鸡大作战 v5.3.7.1 - 黄金加固版</title>
+    <title>咕咕鸡大作战 v5.3.7.2 - 智能对齐版</title>
+    <!-- 引入极速资源 -->
     <script src="https://lib.baomitu.com/vue/2.6.14/vue.min.js"></script>
     <script src="https://lib.baomitu.com/xlsx/0.17.0/xlsx.full.min.js"></script>
     <style>
@@ -31,14 +32,15 @@
         .source-tag { font-size: 8px; padding: 1px 3px; background: #f0f0f0; color: #999; border-radius: 3px; margin-left: 2px; }
         .btn { padding: 6px 12px; border-radius: 6px; border: none; cursor: pointer; font-weight: bold; font-size: 11px; }
         .footer { text-align: center; padding: 30px; font-size: 11px; color: #bbb; }
+        .del-btn { color: #ddd; cursor: pointer; font-size: 16px; margin-left: 4px; }
     </style>
 </head>
 <body>
 
 <div id="app" class="app-container" v-cloak>
     <div class="header">
-        <h1>🐤 <span>咕咕鸡</span>大作战 <small style="font-size: 11px; color: #ccc;">v5.3.7.1 黄金对齐版</small></h1>
-        <p style="font-size: 11px; color: #999;">针对 000216/000218 锁定 2月13日 基准</p>
+        <h1>🐤 <span>咕咕鸡</span>大作战 <small style="font-size: 11px; font-weight: normal; color: #ccc;">v5.3.7.2 智能对齐</small></h1>
+        <p style="font-size: 11px; color: #999;">动态识别确认日，资产计算更精准</p>
     </div>
 
     <!-- 顶部看板 -->
@@ -54,7 +56,7 @@
             </div>
         </div>
         <div class="stat-item">
-            <div class="stat-label">累计总盈亏</div>
+            <div class="stat-label">累计总收益</div>
             <div class="stat-val" :class="overallProfit >= 0 ? 'up' : 'down'">
                 {{ overallProfit >= 0 ? '+' : '' }}{{ formatMoney(overallProfit) }}
             </div>
@@ -67,10 +69,10 @@
         <div v-for="(p, index) in portfolios" :key="'t'+index" @click="currentTab = index" class="tab" :class="{active: currentTab === index}">
             {{ p.name }}
         </div>
-        <div class="tab" @click="addPortfolio" style="background:#fff; border:1px dashed #ccc;">+</div>
+        <div class="tab" @click="addPortfolio" style="background:#fff; border:1px dashed #ccc;">+ 新组</div>
     </div>
 
-    <!-- 操作区 -->
+    <!-- 操作 -->
     <div class="card" v-if="currentTab !== 'all'">
         <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
             <input style="padding:6px; border:1px solid #ffe082; border-radius:6px; width:75px; font-size:12px;" type="text" v-model="newFund.code" placeholder="代码" maxlength="6">
@@ -82,14 +84,14 @@
         </div>
     </div>
 
-    <!-- 数据表 -->
+    <!-- 数据表格 -->
     <div class="card" style="padding: 10px 5px;">
         <table>
             <thead>
                 <tr>
                     <th width="28%">基金/代码</th>
                     <th width="15%">持仓(份额/成本)</th>
-                    <th width="15%">昨日(2.13)基准</th>
+                    <th width="15%">昨日确认基准</th>
                     <th width="15%">今日最新状态</th>
                     <th width="12%">当日收益</th>
                     <th width="15%">累计盈亏</th>
@@ -176,7 +178,6 @@
         methods: {
             formatMoney(val) { return Number(val).toLocaleString('zh-CN', { minimumFractionDigits: 2 }); },
             
-            // --- 核心：万能补盲并发引擎 ---
             async refreshAll() {
                 const codes = new Set();
                 this.portfolios.forEach(p => p.funds && p.funds.forEach(f => codes.add(f.code)));
@@ -185,7 +186,7 @@
                     this.fetchTiantian(code);
                     this.fetchXueqiu(code);
                 });
-                this.status = "数据更新于: " + new Date().toLocaleTimeString();
+                this.status = "对齐于: " + new Date().toLocaleTimeString();
             },
 
             fetchSina(code) {
@@ -195,16 +196,33 @@
                     const raw = window[`hq_str_f_${code}`];
                     if (raw && raw.split(',').length > 4) {
                         const d = raw.split(',');
-                        // 黄金基金 000216/000218 特殊逻辑：d[3] 通常是前一交易日（2.13）
-                        const info = {
+                        
+                        // --- 核心逻辑：智能日期识别 ---
+                        const todayStr = new Date().toISOString().split('T')[0]; // 2026-02-24
+                        const dataDate = d[4]; // 接口返回的日期
+
+                        let basePrice, baseDate, currentPrice, currentTime, source = '官方';
+
+                        if (dataDate === todayStr) {
+                            // 今天的官方答案已经出来了（常见于晚间或高频基金）
+                            basePrice = d[3];      // 取“前一确认日价格”作为基准
+                            baseDate = "昨日确认";
+                            currentPrice = d[1];   // 取“今日确认价格”作为当前价
+                            currentTime = "今日已公布";
+                        } else {
+                            // 今天答案还没出，还在盘中
+                            basePrice = d[1];      // 取接口里最新的那个值作为基准（其实就是昨净）
+                            baseDate = dataDate.substring(5);
+                            // currentPrice 留给天天基金/雪球的估值去填，这里先暂存基准
+                            const exist = this.fundData[code] || {};
+                            currentPrice = exist.currentPrice || d[1];
+                            currentTime = exist.currentTime || "待更新";
+                        }
+
+                        this.updateData(code, {
                             name: (code === '019005' ? '国投瑞银白银期货LOF C' : d[0]),
-                            basePrice: d[3], // 2.13 净值
-                            baseDate: "2.13(假后基准)",
-                            currentPrice: d[1], // 2.23/24 实际净值
-                            currentTime: "今日实际",
-                            source: '官方'
-                        };
-                        this.updateData(code, info);
+                            basePrice, baseDate, currentPrice, currentTime, source
+                        });
                     }
                     document.body.removeChild(script);
                 };
@@ -214,10 +232,11 @@
             fetchTiantian(code) {
                 window.jsonpgz = (data) => {
                     if(data && data.fundcode) {
-                        this.updateData(data.fundcode, {
+                        const info = {
                             name: data.name, basePrice: data.dwjz, baseDate: data.jzrq.substring(5),
                             currentPrice: data.gsz, currentTime: data.gztime.substring(5), gszzl: data.gszzl, source: '估值'
-                        });
+                        };
+                        this.updateData(data.fundcode, info);
                     }
                 };
                 const script = document.createElement('script');
@@ -241,17 +260,15 @@
 
             updateData(code, info) {
                 const exist = this.fundData[code];
-                // 黄金基金强制使用新浪提供的“今日实际”与“前日确认”
-                if ((code === '000216' || code === '000218') && info.source === '官方') {
-                    this.$set(this.fundData, code, { ...info, gszzl: (((Number(info.currentPrice)-Number(info.basePrice))/Number(info.basePrice))*100).toFixed(2) });
-                    return;
-                }
-                if (exist && exist.source === '行情' && info.source !== '行情') return;
-                if (exist && exist.source === '官方' && info.source === '估值') return;
-                this.$set(this.fundData, code, { ...info, gszzl: info.gszzl || (((Number(info.currentPrice)-Number(info.basePrice))/Number(info.basePrice))*100).toFixed(2) });
+                // 如果当前价格已经是“今日已公布”或“实时行情”，不要被“天天估值”覆盖
+                if (exist && exist.currentTime === '今日已公布' && info.source === '估值') return;
+                
+                // 计算涨跌幅
+                const gz = info.gszzl || (((Number(info.currentPrice)-Number(info.basePrice))/Number(info.basePrice))*100).toFixed(2);
+                
+                this.$set(this.fundData, code, { ...info, gszzl: gz });
             },
 
-            // --- 组合管理与导入 ---
             importExcel(e) {
                 const file = e.target.files[0];
                 if (!file || this.currentTab === 'all') return alert("请在具体组合页导入");
@@ -270,16 +287,15 @@
                         }
                     });
                     this.save(); this.refreshAll();
-                    alert("导入完成");
                 };
                 reader.readAsArrayBuffer(file);
             },
             loadData() {
-                const data = localStorage.getItem('guguji_v5371_data');
-                this.portfolios = data ? JSON.parse(data) : [{ name: '默认组合', funds: [] }];
+                const data = localStorage.getItem('guguji_v5372_data');
+                this.portfolios = data ? JSON.parse(data) : [{ name: '我的持仓', funds: [] }];
             },
-            save() { localStorage.setItem('guguji_v5371_data', JSON.stringify(this.portfolios)); },
-            addPortfolio() { const name = prompt("名称"); if(name) { this.portfolios.push({ name, funds: [] }); this.save(); } },
+            save() { localStorage.setItem('guguji_v5372_data', JSON.stringify(this.portfolios)); },
+            addPortfolio() { const name = prompt("组合名称"); if(name) { this.portfolios.push({ name, funds: [] }); this.save(); } },
             removePortfolio() { if(confirm("删除整个组合？")) { this.portfolios.splice(this.currentTab, 1); this.currentTab = 'all'; this.save(); } },
             addFund() {
                 if(!this.newFund.code) return;

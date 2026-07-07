@@ -139,7 +139,7 @@
           <span class="date-text">({{ fund.currentTime || '--' }})</span>
         </td>
 
-        <td :class="changeClass(fund.dayProfit, 'money')">
+        <td :class="changeClass(fund.dayProfit || parseFloat(fund.gszzl) || 0, 'money')">
           {{ fund.gszzl || '0.00' }}%<br><small>{{ formatMoney(fund.dayProfit) }}</small>
         </td>
 

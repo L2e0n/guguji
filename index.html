@@ -57,7 +57,7 @@
 
 <div id="app" class="app-container" v-cloak>
   <div class="header">
-    <h1>🐤 <span>咕咕鸡</span>大作战 <small style="font-size:11px;color:#ccc;">v5.5.0</small></h1>
+    <h1>🐤 <span>咕咕鸡</span>大作战 <small style="font-size:11px;color:#ccc;">v5.5.1</small></h1>
     <p style="font-size:11px;color:#999;"> 咕咕咕</p>
   </div>
 
@@ -176,7 +176,7 @@
     </div>
   </div>
 
-  <div class="footer">&copy; 2026-2028 咕咕鸡大作战 v5.5.0 | 数据源: 雪球/新浪/天天/东方财富</div>
+  <div class="footer">&copy; 2026-2028 咕咕鸡大作战 v5.5.1 | 数据源: 天天基金/东方财富</div>
 </div>
 
 <script>
@@ -187,16 +187,9 @@ new Vue({
     status: '全网对齐中...',
 
     newFund: { code: '', shares: null, cost: null },
-    proxyBase: 'https://api.guguji.icu',
 
     portfolios: JSON.parse(localStorage.getItem('guguji_v540_data')) || JSON.parse(localStorage.getItem('guguji_v5392_data')) || [{ name: '主要投资', funds: [] }],
     fundData: {},
-
-    bjToday: new Date().toLocaleDateString('zh-CN', { timeZone: 'Asia/Shanghai' })
-      .replace(/\//g, '-')
-      .split('-')
-      .map(v => v.padStart(2, '0'))
-      .join('-'),
 
     timer: null,
 
@@ -260,14 +253,6 @@ new Vue({
       return n > 0 ? 'up' : 'down';
     },
 
-    pickXqQuote(res) {
-      if (!res || !res.data) return null;
-      if (res.data.quote) return res.data.quote;
-      if (Array.isArray(res.data) && res.data[0]) return res.data[0];
-      if (Array.isArray(res.data.items) && res.data.items[0]) return res.data.items[0];
-      return null;
-    },
-
     async refreshAll() {
       const codes = new Set();
       this.portfolios.forEach(p => p.funds && p.funds.forEach(f => codes.add(f.code)));
@@ -276,48 +261,9 @@ new Vue({
     },
 
     fetchFund(code) {
-      this.fetchSina(code);
       this.fetchTiantian(code);
-      this.fetchXueqiu(code);
       this.fetchEastMoney(code);
       this.fetchPingZhongName(code);
-    },
-
-    fetchSina(code) {
-      fetch(`${this.proxyBase}/sina/${code}`)
-        .then(r => r.text())
-        .then(res => {
-          const m = res.match(/"(.*)"/);
-          if (!m || !m[1]) return;
-          const d = m[1].split(',');
-          if (!d || d.length < 5) return;
-
-          let basePrice, baseDate, currentPrice, currentTime;
-          if (d[4] === this.bjToday) {
-            basePrice = d[3];
-            baseDate = '昨日确认';
-            currentPrice = d[1];
-            currentTime = '今日已出';
-          } else {
-            basePrice = d[1];
-            baseDate = (d[4] || '').substring(5) || '--';
-            currentPrice = d[1];
-            currentTime = '盘中更新';
-          }
-
-          const bp = Number(basePrice);
-          const cp = Number(currentPrice);
-
-          this.updateData(code, {
-            name: d[0] || '',
-            basePrice: Number.isFinite(bp) ? bp.toFixed(4) : '',
-            baseDate,
-            currentPrice: Number.isFinite(cp) ? cp.toFixed(4) : '',
-            currentTime,
-            source: '官方'
-          });
-        })
-        .catch(() => {});
     },
 
     initTiantianJsonp() {
@@ -351,24 +297,6 @@ new Vue({
       script.onload = () => script.remove();
       script.onerror = () => script.remove();
       document.body.appendChild(script);
-    },
-
-    async fetchXueqiu(code) {
-      try {
-        const res = await fetch(`${this.proxyBase}/xq/${code}`).then(r => r.json());
-        const q = this.pickXqQuote(res);
-        if (!q) return;
-
-        this.updateData(code, {
-          name: q.name,
-          basePrice: q.last_close,
-          baseDate: '昨收价',
-          currentPrice: q.current,
-          currentTime: '实时',
-          gszzl: q.percent,
-          source: '行情'
-        });
-      } catch (_) {}
     },
 
     fetchEastMoney(code) {
@@ -410,10 +338,8 @@ new Vue({
     updateData(code, info) {
       const exist = this.fundData[code] || {};
 
-      if (exist.source === '行情' && info.source !== '行情') return;
-      if (exist.currentTime === '今日已出' && info.source === '估值') return;
       // 已有行情数据时，不覆盖为更低优先级来源
-      if (exist.source === '行情' && info.source === '官方') return;
+      if (exist.source === '行情' && info.source !== '行情') return;
 
       const cp = Number(info.currentPrice);
       const bp = Number(info.basePrice);

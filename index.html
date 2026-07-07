@@ -3,11 +3,11 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>咕咕鸡大作战 v5.3.9.2 </title>
+  <title>咕咕鸡大作战 v5.4.0 </title>
   <script src="https://lib.baomitu.com/vue/2.6.14/vue.min.js"></script>
   <script src="https://lib.baomitu.com/xlsx/0.17.0/xlsx.full.min.js"></script>
   <style>
-    :root { --primary: #fbc02d; --secondary: #2c3e50; --up: #e74c3c; --down: #27ae60; --bg: #fffdf2; }
+    :root { --primary: #fbc02d; --secondary: #2c3e50; --up: #e74c3c; --down: #27ae60; --neutral: #999; --bg: #fffdf2; }
     body { font-family: "PingFang SC", "Microsoft YaHei", sans-serif; background: var(--bg); margin: 0; padding: 10px; color: #333; }
     [v-cloak] { display: none !important; }
     .app-container { max-width: 1300px; margin: 0 auto; padding-bottom: 60px; }
@@ -29,6 +29,8 @@
 
     .up { color: var(--up); font-weight: bold; }
     .down { color: var(--down); font-weight: bold; }
+    .neutral { color: var(--neutral); font-weight: bold; }
+    .zero { color: var(--neutral); font-weight: normal; }
 
     .date-text { font-size: 9px; color: #aaa; display: block; margin-top: 2px; }
     .btn { padding: 6px 12px; border-radius: 6px; border: none; cursor: pointer; font-weight: bold; font-size: 11px; }
@@ -42,7 +44,7 @@
 
 <div id="app" class="app-container" v-cloak>
   <div class="header">
-    <h1>🐤 <span>咕咕鸡</span>大作战 <small style="font-size:11px;color:#ccc;">v5.3.9.2</small></h1>
+    <h1>🐤 <span>咕咕鸡</span>大作战 <small style="font-size:11px;color:#ccc;">v5.4.0</small></h1>
     <p style="font-size:11px;color:#999;"> 咕咕咕</p>
   </div>
 
@@ -53,13 +55,13 @@
     </div>
     <div class="stat-item">
       <div class="stat-label">今日预估盈亏</div>
-      <div class="stat-val" :class="totalDayProfit >= 0 ? 'up' : 'down'">
+      <div class="stat-val" :class="changeClass(totalDayProfit, 'money')">
         {{ totalDayProfit >= 0 ? '+' : '' }}{{ formatMoney(totalDayProfit) }}
       </div>
     </div>
     <div class="stat-item">
       <div class="stat-label">累计总收益</div>
-      <div class="stat-val" :class="overallProfit >= 0 ? 'up' : 'down'">
+      <div class="stat-val" :class="changeClass(overallProfit, 'money')">
         {{ overallProfit >= 0 ? '+' : '' }}{{ formatMoney(overallProfit) }}
       </div>
     </div>
@@ -83,6 +85,11 @@
       <label class="btn" style="background:#2e7d32;color:#fff;margin-left:10px;">
         📊 Excel 导入
         <input type="file" style="display:none" @change="importExcel" accept=".xlsx,.xls">
+      </label>
+
+      <label class="btn" style="background:#1565c0;color:#fff;">
+        📷 OCR 识别
+        <input type="file" style="display:none" @change="ocrUpload" accept="image/*">
       </label>
 
       <button class="btn" style="background:#f5f5f5;color:#999;margin-left:auto;" @click="removePortfolio">删除组</button>
@@ -118,17 +125,17 @@
         </td>
 
         <td>
-          <div style="font-weight:bold;" :class="parseFloat(fund.gszzl || 0) >= 0 ? 'up' : 'down'">
+          <div style="font-weight:bold;" :class="changeClass(parseFloat(fund.gszzl || 0))">
             {{ fund.currentPrice || '--' }}
           </div>
           <span class="date-text">({{ fund.currentTime || '--' }})</span>
         </td>
 
-        <td :class="fund.dayProfit >= 0 ? 'up' : 'down'">
+        <td :class="changeClass(fund.dayProfit, 'money')">
           {{ fund.gszzl || '0.00' }}%<br><small>{{ formatMoney(fund.dayProfit) }}</small>
         </td>
 
-        <td :class="fund.totalProfit >= 0 ? 'up' : 'down'">
+        <td :class="changeClass(fund.totalProfit, 'money')">
           <div style="display:flex;align-items:center;justify-content:space-between;">
             <div>{{ formatMoney(fund.totalProfit) }}<br><small>{{ fund.totalProfitRate }}%</small></div>
             <span v-if="currentTab !== 'all'" class="del-btn" @click="deleteFund(fund.code)">✕</span>
@@ -139,7 +146,7 @@
     </table>
   </div>
 
-  <div class="footer">&copy; 2026-2028 咕咕鸡大作战 | 数据源: 雪球/新浪/天天</div>
+  <div class="footer">&copy; 2026-2028 咕咕鸡大作战 v5.4.0 | 数据源: 雪球/新浪/天天/东方财富</div>
 </div>
 
 <script>
@@ -151,8 +158,9 @@ new Vue({
 
     newFund: { code: '', shares: null, cost: null },
     proxyBase: 'https://api.guguji.icu',
+    ocrEndpoint: 'http://localhost:5000/api/ocr',
 
-    portfolios: JSON.parse(localStorage.getItem('guguji_v5392_data')) || [{ name: '主要投资', funds: [] }],
+    portfolios: JSON.parse(localStorage.getItem('guguji_v540_data')) || JSON.parse(localStorage.getItem('guguji_v5392_data')) || [{ name: '主要投资', funds: [] }],
     fundData: {},
 
     bjToday: new Date().toLocaleDateString('zh-CN', { timeZone: 'Asia/Shanghai' })
@@ -215,6 +223,12 @@ new Vue({
       return Number.isFinite(n) ? n.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '0.00';
     },
 
+    changeClass(val, mode) {
+      const n = Number(val);
+      if (!Number.isFinite(n) || Math.abs(n) < 0.0001) return mode === 'money' ? 'zero' : 'neutral';
+      return n > 0 ? 'up' : 'down';
+    },
+
     pickXqQuote(res) {
       if (!res || !res.data) return null;
       if (res.data.quote) return res.data.quote;
@@ -234,6 +248,7 @@ new Vue({
       this.fetchSina(code);
       this.fetchTiantian(code);
       this.fetchXueqiu(code);
+      this.fetchEastMoney(code);
     },
 
     fetchSina(code) {
@@ -324,11 +339,49 @@ new Vue({
       } catch (_) {}
     },
 
+    fetchEastMoney(code) {
+      if (!this._emSeq) this._emSeq = 0;
+      const seq = ++this._emSeq;
+      const cbName = 'emCb' + seq;
+      const timeout = setTimeout(() => { if (window[cbName]) { delete window[cbName]; } }, 8000);
+
+      window[cbName] = (data) => {
+        clearTimeout(timeout);
+        delete window[cbName];
+        if (!data || data.f43 === undefined || data.f43 === '-' || !data.f57) return;
+
+        const cur = Number(data.f43);
+        const base = Number(data.f47);
+        const pct = Number(data.f170);
+
+        this.updateData(code, {
+          name: String(data.f58 || ''),
+          basePrice: Number.isFinite(base) ? base.toFixed(4) : undefined,
+          baseDate: '昨收价',
+          currentPrice: Number.isFinite(cur) ? cur.toFixed(4) : undefined,
+          currentTime: '实时',
+          gszzl: Number.isFinite(pct) ? pct.toFixed(2) : undefined,
+          source: '行情'
+        });
+      };
+
+      // Try Shenzhen market (1.) for LOF/ETF, fallback to Shanghai (0.)
+      [1, 0].forEach(mkt => {
+        const s = document.createElement('script');
+        s.src = `https://push2.eastmoney.com/api/qt/stock/get?secid=${mkt}.${code}&fields=f43,f44,f45,f46,f47,f48,f57,f58,f169,f170&cb=${cbName}`;
+        s.async = true;
+        s.onload = () => s.remove();
+        document.body.appendChild(s);
+      });
+    },
+
     updateData(code, info) {
       const exist = this.fundData[code] || {};
 
       if (exist.source === '行情' && info.source !== '行情') return;
       if (exist.currentTime === '今日已出' && info.source === '估值') return;
+      // 已有行情数据时，不覆盖为更低优先级来源
+      if (exist.source === '行情' && info.source === '官方') return;
 
       const cp = Number(info.currentPrice);
       const bp = Number(info.basePrice);
@@ -337,8 +390,11 @@ new Vue({
       if (gz === undefined || gz === null || gz === '') {
         gz = (bp > 0 && Number.isFinite(cp)) ? (((cp - bp) / bp) * 100).toFixed(2) : '0.00';
       }
+      // 防止 -0.00 显示问题
+      const gzNum = parseFloat(gz);
+      const gzStr = (Math.abs(gzNum) < 0.001) ? '0.00' : gz;
 
-      this.$set(this.fundData, code, { ...info, gszzl: String(gz) });
+      this.$set(this.fundData, code, { ...info, gszzl: gzStr });
     },
 
     importExcel(e) {
@@ -383,8 +439,55 @@ new Vue({
       reader.readAsArrayBuffer(file);
     },
 
+    ocrUpload(e) {
+      const file = e.target.files[0];
+      if (!file || this.currentTab === 'all') return alert('请先进入具体组合页');
+
+      const formData = new FormData();
+      formData.append('image', file);
+
+      const btn = e.target.parentElement;
+      const orig = btn.textContent;
+      btn.textContent = '⏳ 识别中...';
+      btn.style.pointerEvents = 'none';
+
+      fetch(this.ocrEndpoint, {
+        method: 'POST',
+        body: formData
+      })
+        .then(r => r.json())
+        .then(res => {
+          if (res.error) { alert('识别失败: ' + res.error); return; }
+          if (!res.funds || !res.funds.length) { alert('未识别到基金信息'); return; }
+
+          let added = 0;
+          res.funds.forEach(f => {
+            this.portfolios[this.currentTab].funds.push({
+              code: f.code,
+              shares: Number(f.shares || 0),
+              cost: Number(f.cost || 0)
+            });
+            added++;
+          });
+
+          this.save();
+          this.refreshAll();
+          alert(`OCR 识别完成！已添加 ${added} 个基金`);
+        })
+        .catch(err => {
+          alert('OCR 请求失败: ' + err.message + '\n请确保 OCR 服务已启动');
+        })
+        .finally(() => {
+          btn.textContent = orig;
+          btn.style.pointerEvents = '';
+          e.target.value = '';
+        });
+    },
+
     save() {
-      localStorage.setItem('guguji_v5392_data', JSON.stringify(this.portfolios));
+      localStorage.setItem('guguji_v540_data', JSON.stringify(this.portfolios));
+      // 清理旧版本数据
+      try { localStorage.removeItem('guguji_v5392_data'); } catch(e) {}
     },
 
     addPortfolio() {

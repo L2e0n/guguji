@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>咕咕鸡大作战 v5.4.0 </title>
+  <title>咕咕鸡大作战 v5.5.0 </title>
   <script src="https://lib.baomitu.com/vue/2.6.14/vue.min.js"></script>
   <script src="https://lib.baomitu.com/xlsx/0.17.0/xlsx.full.min.js"></script>
   <style>
@@ -38,13 +38,26 @@
     .del-btn:hover { color: var(--up); }
     .source-tag { font-size: 8px; padding: 1px 3px; background: #f0f0f0; color: #999; border-radius: 3px; margin-left: 2px; }
     .footer { text-align: center; padding: 30px; font-size: 11px; color: #bbb; }
+
+    /* 历史净值弹窗 */
+    .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.3); z-index: 100; display:flex; align-items:center; justify-content:center; }
+    .modal-card { background:#fff; border-radius:16px; padding:20px; max-width:500px; width:90%; max-height:80vh; overflow-y:auto; box-shadow:0 8px 30px rgba(0,0,0,.15); }
+    .modal-card h3 { margin:0 0 12px; font-size:15px; color:var(--secondary); }
+    .modal-close { float:right; cursor:pointer; font-size:20px; color:#ccc; }
+    .modal-close:hover { color:var(--up); }
+    .history-table { width:100%; border-collapse:collapse; font-size:12px; }
+    .history-table th { text-align:center; font-size:10px; color:#999; padding:6px 4px; border-bottom:1px solid #fff3e0; }
+    .history-table td { text-align:center; padding:6px 4px; border-bottom:1px solid #fff8e1; }
+    .fund-link { cursor:pointer; }
+    .fund-link:hover { color:var(--primary); text-decoration:underline; }
+    .fund-name-wrap { display:flex; align-items:center; gap:4px; }
   </style>
 </head>
 <body>
 
 <div id="app" class="app-container" v-cloak>
   <div class="header">
-    <h1>🐤 <span>咕咕鸡</span>大作战 <small style="font-size:11px;color:#ccc;">v5.4.0</small></h1>
+    <h1>🐤 <span>咕咕鸡</span>大作战 <small style="font-size:11px;color:#ccc;">v5.5.0</small></h1>
     <p style="font-size:11px;color:#999;"> 咕咕咕</p>
   </div>
 
@@ -109,9 +122,9 @@
       </thead>
       <tbody>
       <tr v-for="(fund, index) in displayedFunds" :key="fund.code + '_' + index">
-        <td>
-          <div style="font-weight:bold;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:160px;">
-            {{ fund.name || '识别中...' }}
+        <td style="cursor:pointer;">
+          <div style="font-weight:bold;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:160px;" @click="showHistory(fund.code)">
+            <span class="fund-link">{{ fund.name || '识别中...' }}</span>
           </div>
           <div style="font-size:10px;color:#bbb;">
             {{ fund.code }}
@@ -146,7 +159,29 @@
     </table>
   </div>
 
-  <div class="footer">&copy; 2026-2028 咕咕鸡大作战 v5.4.0 | 数据源: 雪球/新浪/天天/东方财富</div>
+  <!-- 历史净值弹窗 -->
+  <div class="modal-overlay" v-if="historyModal.show" @click.self="closeHistory">
+    <div class="modal-card">
+      <span class="modal-close" @click="closeHistory">&times;</span>
+      <h3>{{ historyModal.name || historyModal.code }} 历史净值</h3>
+      <table class="history-table" v-if="historyModal.records.length">
+        <thead>
+          <tr><th>日期</th><th>单位净值</th><th>累计净值</th><th>涨跌幅</th></tr>
+        </thead>
+        <tbody>
+          <tr v-for="r in historyModal.records" :key="r.date">
+            <td>{{ r.date }}</td>
+            <td>{{ r.nav }}</td>
+            <td>{{ r.acc_nav }}</td>
+            <td :class="changeClass(r.change_pct)">{{ r.change_pct >= 0 ? '+' : '' }}{{ r.change_pct }}%</td>
+          </tr>
+        </tbody>
+      </table>
+      <div v-else style="text-align:center;padding:30px;color:#ccc;">加载中...</div>
+    </div>
+  </div>
+
+  <div class="footer">&copy; 2026-2028 咕咕鸡大作战 v5.5.0 | 数据源: 雪球/新浪/天天/东方财富</div>
 </div>
 
 <script>
@@ -169,7 +204,9 @@ new Vue({
       .map(v => v.padStart(2, '0'))
       .join('-'),
 
-    timer: null
+    timer: null,
+
+    historyModal: { show: false, code: '', name: '', records: [] }
   },
 
   computed: {
@@ -249,6 +286,7 @@ new Vue({
       this.fetchTiantian(code);
       this.fetchXueqiu(code);
       this.fetchEastMoney(code);
+      this.fetchPingZhongName(code);
     },
 
     fetchSina(code) {
@@ -395,6 +433,58 @@ new Vue({
       const gzStr = (Math.abs(gzNum) < 0.001) ? '0.00' : gz;
 
       this.$set(this.fundData, code, { ...info, gszzl: gzStr });
+    },
+
+    fetchPingZhongName(code) {
+      if (this.fundData[code] && this.fundData[code].name) return;
+      const script = document.createElement('script');
+      script.src = `https://fund.eastmoney.com/pingzhongdata/${code}.js?t=${Date.now()}`;
+      script.async = true;
+      script.onload = () => {
+        script.remove();
+        const name = window.fS_name || '';
+        ['fS_name','fS_code','fS_establishment','fS_scale'].forEach(k => { try { delete window[k]; } catch(e) {} });
+        if (name) {
+          const exist = this.fundData[code] || {};
+          this.$set(this.fundData, code, { ...exist, name });
+        }
+      };
+      script.onerror = () => script.remove();
+      document.body.appendChild(script);
+    },
+
+    fetchHistory(code) {
+      const cb = 'lsjzCb' + Date.now() + Math.random().toString(36).slice(2,4);
+      window[cb] = (data) => {
+        delete window[cb];
+        try {
+          if (data && data.Data && data.Data.LSJZList) {
+            this.historyModal.records = data.Data.LSJZList.map(r => ({
+              date: r.FSRQ, nav: r.DWJZ, acc_nav: r.LJJZ,
+              change_pct: parseFloat(r.JZZZL || 0)
+            }));
+          } else {
+            this.historyModal.records = [];
+          }
+        } catch(e) { this.historyModal.records = []; }
+      };
+      const s = document.createElement('script');
+      s.src = `https://api.fund.eastmoney.com/f10/lsjz?fundCode=${code}&pageIndex=1&pageSize=10&callback=${cb}`;
+      s.async = true;
+      s.onload = () => s.remove();
+      s.onerror = () => { delete window[cb]; s.remove(); };
+      document.body.appendChild(s);
+    },
+
+    showHistory(code) {
+      if (this.historyModal.show && this.historyModal.code === code) { this.closeHistory(); return; }
+      const name = (this.fundData[code] && this.fundData[code].name) || code;
+      this.historyModal = { show: true, code, name, records: [] };
+      this.fetchHistory(code);
+    },
+
+    closeHistory() {
+      this.historyModal.show = false;
     },
 
     importExcel(e) {

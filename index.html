@@ -100,11 +100,6 @@
         <input type="file" style="display:none" @change="importExcel" accept=".xlsx,.xls">
       </label>
 
-      <label class="btn" style="background:#1565c0;color:#fff;">
-        📷 OCR 识别
-        <input type="file" style="display:none" @change="ocrUpload" accept="image/*">
-      </label>
-
       <button class="btn" style="background:#f5f5f5;color:#999;margin-left:auto;" @click="removePortfolio">删除组</button>
     </div>
   </div>
@@ -193,7 +188,6 @@ new Vue({
 
     newFund: { code: '', shares: null, cost: null },
     proxyBase: 'https://api.guguji.icu',
-    ocrEndpoint: 'http://localhost:5000/api/ocr',
 
     portfolios: JSON.parse(localStorage.getItem('guguji_v540_data')) || JSON.parse(localStorage.getItem('guguji_v5392_data')) || [{ name: '主要投资', funds: [] }],
     fundData: {},
@@ -527,51 +521,6 @@ new Vue({
         }
       };
       reader.readAsArrayBuffer(file);
-    },
-
-    ocrUpload(e) {
-      const file = e.target.files[0];
-      if (!file || this.currentTab === 'all') return alert('请先进入具体组合页');
-
-      const formData = new FormData();
-      formData.append('image', file);
-
-      const btn = e.target.parentElement;
-      const orig = btn.textContent;
-      btn.textContent = '⏳ 识别中...';
-      btn.style.pointerEvents = 'none';
-
-      fetch(this.ocrEndpoint, {
-        method: 'POST',
-        body: formData
-      })
-        .then(r => r.json())
-        .then(res => {
-          if (res.error) { alert('识别失败: ' + res.error); return; }
-          if (!res.funds || !res.funds.length) { alert('未识别到基金信息'); return; }
-
-          let added = 0;
-          res.funds.forEach(f => {
-            this.portfolios[this.currentTab].funds.push({
-              code: f.code,
-              shares: Number(f.shares || 0),
-              cost: Number(f.cost || 0)
-            });
-            added++;
-          });
-
-          this.save();
-          this.refreshAll();
-          alert(`OCR 识别完成！已添加 ${added} 个基金`);
-        })
-        .catch(err => {
-          alert('OCR 请求失败: ' + err.message + '\n请确保 OCR 服务已启动');
-        })
-        .finally(() => {
-          btn.textContent = orig;
-          btn.style.pointerEvents = '';
-          e.target.value = '';
-        });
     },
 
     save() {

@@ -176,7 +176,7 @@
     </div>
   </div>
 
-  <div class="footer">&copy; 2026-2028 咕咕鸡大作战 v5.5.1 | 数据源: 天天基金/东方财富</div>
+  <div class="footer">&copy; 2026-2028 咕咕鸡大作战 v5.5.1 | 数据源: 天天基金/东方财富/新浪</div>
 </div>
 
 <script>
@@ -187,6 +187,7 @@ new Vue({
     status: '全网对齐中...',
 
     newFund: { code: '', shares: null, cost: null },
+    proxyBase: 'https://api.guguji.icu',
 
     portfolios: JSON.parse(localStorage.getItem('guguji_v540_data')) || JSON.parse(localStorage.getItem('guguji_v5392_data')) || [{ name: '主要投资', funds: [] }],
     fundData: {},
@@ -263,6 +264,7 @@ new Vue({
     fetchFund(code) {
       this.fetchTiantian(code);
       this.fetchEastMoney(code);
+      this.fetchSina(code);
       this.fetchPingZhongName(code);
     },
 
@@ -338,8 +340,9 @@ new Vue({
     updateData(code, info) {
       const exist = this.fundData[code] || {};
 
-      // 已有行情数据时，不覆盖为更低优先级来源
+      // 行情(东财) > 估值(天天) > 官方(新浪)
       if (exist.source === '行情' && info.source !== '行情') return;
+      if (exist.source === '估值' && info.source === '官方') return;
 
       const cp = Number(info.currentPrice);
       const bp = Number(info.basePrice);
@@ -353,6 +356,31 @@ new Vue({
       const gzStr = (Math.abs(gzNum) < 0.001) ? '0.00' : gz;
 
       this.$set(this.fundData, code, { ...info, gszzl: gzStr });
+    },
+
+    fetchSina(code) {
+      fetch(`${this.proxyBase}/sina/${code}`)
+        .then(r => r.text())
+        .then(res => {
+          const m = res.match(/"(.*)"/);
+          if (!m || !m[1]) return;
+          const d = m[1].split(',');
+          if (!d || d.length < 5) return;
+          const cp = parseFloat(d[3]);
+          const bp = parseFloat(d[2]);
+          if (!Number.isFinite(cp) || !Number.isFinite(bp) || bp === 0) return;
+          const pct = ((cp - bp) / bp * 100).toFixed(2);
+          this.updateData(code, {
+            name: d[0] || '',
+            basePrice: bp.toFixed(4),
+            baseDate: '昨收价',
+            currentPrice: cp.toFixed(4),
+            currentTime: '净值',
+            gszzl: pct,
+            source: '官方'
+          });
+        })
+        .catch(() => {});
     },
 
     fetchPingZhongName(code) {

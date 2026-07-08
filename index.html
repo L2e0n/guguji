@@ -14,6 +14,13 @@
     .card { background: #fff; border-radius: 16px; padding: 15px; box-shadow: 0 8px 20px rgba(251, 192, 45, 0.05); margin-bottom: 15px; border: 1px solid #ffecb3; }
     .header { text-align: center; margin-bottom: 15px; }
     .header h1 { color: var(--secondary); margin: 0; font-size: 22px; }
+    .app-hub { display:grid; grid-template-columns: repeat(3, 1fr); gap:10px; margin-bottom:15px; }
+    .app-card { text-decoration:none; color:var(--secondary); background:#fff; border:1px solid #ffecb3; border-radius:14px; padding:12px; box-shadow:0 6px 16px rgba(251,192,45,.06); transition:.18s; display:flex; align-items:center; gap:10px; min-height:58px; }
+    .app-card:hover { transform:translateY(-2px); border-color:var(--primary); box-shadow:0 8px 22px rgba(251,192,45,.18); }
+    .app-icon { width:34px; height:34px; border-radius:12px; background:#fff8e1; display:flex; align-items:center; justify-content:center; font-size:19px; flex-shrink:0; }
+    .app-title { font-weight:bold; font-size:13px; line-height:1.2; }
+    .app-desc { font-size:10px; color:#999; margin-top:2px; }
+    @media (max-width: 720px) { .app-hub { grid-template-columns: 1fr; } }
     .summary-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
     .stat-item { text-align: center; border-right: 1px solid #fff3e0; }
     .stat-item:last-child { border-right: none; }
@@ -59,6 +66,30 @@
   <div class="header">
     <h1>🐤 <span>咕咕鸡</span>大作战 <small style="font-size:11px;color:#ccc;">v5.5.1</small></h1>
     <p style="font-size:11px;color:#999;"> 咕咕咕</p>
+  </div>
+
+  <div class="app-hub">
+    <a class="app-card" href="https://guguji.icu" title="咕咕鸡大作战">
+      <span class="app-icon">📈</span>
+      <span>
+        <div class="app-title">基金估值仪表盘</div>
+        <div class="app-desc">咕咕鸡主站</div>
+      </span>
+    </a>
+    <a class="app-card" href="https://yi.guguji.icu" title="大衍筮法">
+      <span class="app-icon">🔮</span>
+      <span>
+        <div class="app-title">大衍筮法</div>
+        <div class="app-desc">周易蓍草占卜</div>
+      </span>
+    </a>
+    <a class="app-card" href="https://test.guguji.icu" title="测试实验室">
+      <span class="app-icon">🧪</span>
+      <span>
+        <div class="app-title">测试实验室</div>
+        <div class="app-desc">开发测试页面</div>
+      </span>
+    </a>
   </div>
 
   <div class="card summary-grid">

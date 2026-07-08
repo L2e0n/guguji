@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>咕咕鸡大作战 v5.3.7.4 - 日期精准对齐版</title>
+    <script src="https://lib.baomitu.com/vue/2.6.14/vue.min.js"></script>
+    <script src="https://lib.baomitu.com/xlsx/0.17.0/xlsx.full.min.js"></script>
+    <style>
+        :root { --primary: #fbc02d; --secondary: #2c3e50; --up: #e74c3c; --down: #27ae60; --bg: #fffdf2; }
+        body { font-family: "PingFang SC", "Microsoft YaHei", sans-serif; background: var(--bg); margin: 0; padding: 10px; color: #333; }
+        [v-cloak] { display: none !important; }
+        .app-container { max-width: 1100px; margin: 0 auto; padding-bottom: 60px; }
+        .card { background: white; border-radius: 16px; padding: 15px; box-shadow: 0 8px 20px rgba(251,192,45,0.08); margin-bottom: 15px; border: 1px solid #ffecb3; }
+        .header { text-align: center; margin-bottom: 15px; }
+        .header h1 { color: var(--secondary); margin: 0; font-size: 22px; }
+        .summary-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+        .stat-item { text-align: center; border-right: 1px solid #fff3e0; }
+        .stat-item:last-child { border-right: none; }
+        .stat-label { font-size: 11px; color: #888; margin-bottom: 5px; }
+        .stat-val { font-size: 14px; font-weight: bold; color: var(--secondary); font-family: 'Verdana'; }
+        .tabs { display: flex; gap: 8px; margin-bottom: 12px; overflow-x: auto; scrollbar-width: none; }
+        .tab { padding: 6px 16px; background: #eee; border-radius: 18px; cursor: pointer; white-space: nowrap; font-size: 13px; font-weight: bold; }
+        .tab.active { background: var(--primary); color: #000; box-shadow: 0 4px 10px rgba(251, 192, 45, 0.3); }
+        table { width: 100%; border-collapse: collapse; }
+        th { text-align: left; font-size: 10px; color: #999; padding: 8px; border-bottom: 2px solid #fff3e0; background: #fffcf5; }
+        td { padding: 10px 8px; border-bottom: 1px solid #fff8e1; font-size: 12px; }
+        .up { color: var(--up); font-weight: bold; }
+        .down { color: var(--down); font-weight: bold; }
+        .date-text { font-size: 9px; color: #aaa; display: block; margin-top: 2px; }
+        .source-tag { font-size: 8px; padding: 1px 3px; background: #f0f0f0; color: #999; border-radius: 3px; margin-left: 2px; }
+        .btn { padding: 6px 12px; border-radius: 6px; border: none; cursor: pointer; font-weight: bold; font-size: 11px; }
+        .del-btn { color: #ddd; cursor: pointer; font-size: 16px; margin-left: 4px; }
+    </style>
+</head>
+<body>
+
+<div id="app" class="app-container" v-cloak>
+    <div class="header">
+        <h1>🐤 <span>咕咕鸡</span>大作战 <small style="font-size: 11px; font-weight: normal; color: #ccc;">v5.3.7.4</small></h1>
+        <p style="font-size: 11px; color: #999;">北京时间对齐优化，Excel 导入加固</p>
+    </div>
+
+    <!-- 看板 -->
+    <div class="card summary-grid">
+        <div class="stat-item">
+            <div class="stat-label">账户总资产</div>
+            <div class="stat-val">{{ formatMoney(totalAssets) }}</div>
+        </div>
+        <div class="stat-item">
+            <div class="stat-label">当日预估盈亏</div>
+            <div class="stat-val" :class="totalDayProfit >= 0 ? 'up' : 'down'">
+                {{ totalDayProfit >= 0 ? '+' : '' }}{{ formatMoney(totalDayProfit) }}
+            </div>
+        </div>
+        <div class="stat-item">
+            <div class="stat-label">累计总盈亏</div>
+            <div class="stat-val" :class="overallProfit >= 0 ? 'up' : 'down'">
+                {{ overallProfit >= 0 ? '+' : '' }}{{ formatMoney(overallProfit) }}
+            </div>
+        </div>
+    </div>
+
+    <!-- 导航 -->
+    <div class="tabs">
+        <div class="tab" :class="{active: currentTab === 'all'}" @click="currentTab = 'all'">汇总</div>
+        <div v-for="(p, index) in portfolios" :key="'t'+index" @click="currentTab = index" class="tab" :class="{active: currentTab === index}">
+            {{ p.name }}
+        </div>
+        <div class="tab" @click="addPortfolio" style="background:#fff; border:1px dashed #ccc;">+</div>
+    </div>
+
+    <!-- 操作 -->
+    <div class="card" v-if="currentTab !== 'all'">
+        <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+            <input style="padding:6px; border:1px solid #ffe082; border-radius:6px; width:75px; font-size:12px;" type="text" v-model="newFund.code" placeholder="代码" maxlength="6">
+            <input style="padding:6px; border:1px solid #ffe082; border-radius:6px; width:75px; font-size:12px;" type="number" v-model.number="newFund.shares" placeholder="份额">
+            <input style="padding:6px; border:1px solid #ffe082; border-radius:6px; width:75px; font-size:12px;" type="number" v-model.number="newFund.cost" placeholder="成本价">
+            <button class="btn" style="background:var(--secondary); color:white;" @click="addFund">添加</button>
+            <label class="btn" style="background:#2e7d32; color:white;">📊 导入 Excel <input type="file" style="display:none" @change="importExcel" accept=".xlsx, .xls"></label>
+            <button class="btn" style="background:#f5f5f5; color:#999; margin-left: auto;" @click="removePortfolio">删除组</button>
+        </div>
+    </div>
+
+    <!-- 表格 -->
+    <div class="card" style="padding: 10px 5px;">
+        <table>
+            <thead>
+                <tr>
+                    <th width="28%">基金/代码</th>
+                    <th width="18%">持仓(份额/成本)</th>
+                    <th width="15%">昨日确认基准</th>
+                    <th width="15%">今日最新状态</th>
+                    <th width="12%">当日收益</th>
+                    <th width="12%">累计盈亏</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr v-for="(fund, index) in displayedFunds" :key="fund.code + index">
+                    <td>
+                        <div style="font-weight:bold; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 130px;">
+                            {{ fund.name || '识别中...' }}
+                        </div>
+                        <div style="font-size:10px; color:#bbb;">{{ fund.code }} <span class="source-tag" v-if="fund.source">{{ fund.source }}</span></div>
+                    </td>
+                    <td>
+                        <div style="font-weight: bold; color: #555;">{{ Number(fund.shares).toFixed(2) }}</div>
+                        <div style="font-size: 10px; color: #999;">成本: {{ Number(fund.cost).toFixed(4) }}</div>
+                    </td>
+                    <td>
+                        <div style="font-weight: bold; color: #666;">{{ fund.basePrice || '--' }}</div>
+                        <span class="date-text">{{ fund.baseDate || '--' }}</span>
+                    </td>
+                    <td>
+                        <div style="font-weight: bold;" :class="parseFloat(fund.gszzl) >= 0 ? 'up' : 'down'">
+                            {{ fund.currentPrice || '--' }}
+                        </div>
+                        <span class="date-text">{{ fund.currentTime || '--' }}</span>
+                    </td>
+                    <td :class="fund.dayProfit >= 0 ? 'up' : 'down'">
+                        {{ fund.gszzl }}%<br><small>{{ formatMoney(fund.dayProfit) }}</small>
+                    </td>
+                    <td :class="fund.totalProfit >= 0 ? 'up' : 'down'">
+                        {{ formatMoney(fund.totalProfit) }}<br><small>{{ fund.totalProfitRate }}%</small>
+                        <span v-if="currentTab !== 'all'" class="del-btn" @click="deleteFund(fund.code)">✕</span>
+                    </td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+
+    <div class="footer">&copy; 2026-2028 咕咕鸡大作战 | 版权所有 里昂所有</div>
+</div>
+
+<script>
+    new Vue({
+        el: '#app',
+        data: {
+            currentTab: 'all',
+            status: '正在对齐数据...',
+            newFund: { code: '', shares: null, cost: null },
+            proxyBase: 'https://api.guguji.icu',
+            portfolios: [], 
+            fundData: {}
+        },
+        computed: {
+            displayedFunds() {
+                let list = [];
+                const target = this.currentTab === 'all' ? this.portfolios : [this.portfolios[this.currentTab]];
+                target.forEach(p => { if(p && p.funds) list = list.concat(p.funds); });
+                return list.map(f => {
+                    const info = this.fundData[f.code] || {};
+                    const cur = Number(info.currentPrice) || 0;
+                    const base = Number(info.basePrice) || 0;
+                    const cost = Number(f.cost) || 0;
+                    const shares = Number(f.shares) || 0;
+                    const dayProfit = (cur > 0 && base > 0) ? (shares * (cur - base)) : 0;
+                    const totalProfit = (cur > 0 && cost > 0) ? (shares * (cur - cost)) : 0;
+                    const totalProfitRate = (cost > 0 && cur > 0) ? ((totalProfit / (cost * shares)) * 100).toFixed(2) : '0.00';
+                    return { ...f, ...info, dayProfit, totalProfit, totalProfitRate };
+                });
+            },
+            totalAssets() {
+                return this.displayedFunds.reduce((sum, f) => sum + (Number(f.shares) * (Number(this.fundData[f.code]?.currentPrice) || Number(f.cost))), 0);
+            },
+            totalDayProfit() { return this.displayedFunds.reduce((sum, f) => sum + f.dayProfit, 0); },
+            overallProfit() { return this.displayedFunds.reduce((sum, f) => sum + f.totalProfit, 0); }
+        },
+        methods: {
+            formatMoney(val) { return Number(val).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 }); },
+            
+            // --- 健壮 Excel 导入引擎 ---
+            importExcel(e) {
+                const file = e.target.files[0];
+                if (!file || this.currentTab === 'all') return alert("请先选择一个具体组合标签页再导入");
+                const reader = new FileReader();
+                reader.onload = (ev) => {
+                    try {
+                        const workbook = XLSX.read(new Uint8Array(ev.target.result), { type: 'array' });
+                        const sheet = workbook.Sheets[workbook.SheetNames[0]];
+                        const jsonData = XLSX.utils.sheet_to_json(sheet);
+                        let count = 0;
+                        jsonData.forEach(row => {
+                            let code = "", shares = 0, cost = 0;
+                            for (let key in row) {
+                                let k = key.toString().replace(/\s+/g, "");
+                                let val = row[key];
+                                const cleanNum = (v) => parseFloat(v.toString().replace(/[^\d.]/g, "")) || 0;
+                                if (k.includes("码")) code = val.toString().trim();
+                                if (k.includes("份")) shares = cleanNum(val);
+                                if (k.includes("本")) cost = cleanNum(val);
+                            }
+                            if (code) {
+                                while(code.length < 6) code = '0' + code;
+                                this.portfolios[this.currentTab].funds.push({ code, shares, cost });
+                                count++;
+                            }
+                        });
+                        this.save(); this.refreshAll();
+                        alert(`成功识别并导入 ${count} 条持仓！`);
+                    } catch (err) { alert("Excel 解析错误"); }
+                };
+                reader.readAsArrayBuffer(file);
+            },
+
+            // --- 核心：北京时间日期感知引擎 ---
+            async refreshAll() {
+                const codes = new Set();
+                this.portfolios.forEach(p => p.funds && p.funds.forEach(f => codes.add(f.code)));
+                codes.forEach(code => { this.fetchSina(code); this.fetchTiantian(code); });
+                this.status = "校准时间: " + new Date().toLocaleTimeString('zh-CN');
+            },
+
+            fetchSina(code) {
+                const script = document.createElement('script');
+                script.src = `https://hq.sinajs.cn/list=f_${code}`;
+                script.onload = () => {
+                    const raw = window[`hq_str_f_${code}`];
+                    if (raw && raw.split(',').length > 4) {
+                        const d = raw.split(',');
+                        // 获取北京时间今日日期 (YYYY-MM-DD)
+                        const bjToday = new Date().toLocaleDateString('zh-CN', {timeZone: 'Asia/Shanghai'}).replace(/\//g, '-').split('-').map(v => v.padStart(2,'0')).join('-');
+                        const dataDate = d[4]; // 接口返回的日期
+
+                        let basePrice, baseDate, currentPrice, currentTime;
+
+                        if (dataDate === bjToday) {
+                            // 今日确认净值已出（如 000216 在深夜 11 点的状态）
+                            basePrice = d[3]; baseDate = "昨日已确认";
+                            currentPrice = d[1]; currentTime = "今日实际";
+                        } else {
+                            // 还在盘中或今日净值未出
+                            basePrice = d[1]; baseDate = dataDate.substring(5);
+                            const exist = this.fundData[code] || {};
+                            currentPrice = exist.currentPrice || d[1];
+                            currentTime = exist.currentTime || "盘中更新";
+                        }
+                        this.updateData(code, { name: (code==='019005'?'国投白银期货LOF C':d[0]), basePrice, baseDate, currentPrice, currentTime, source: '官方' });
+                    }
+                    document.body.removeChild(script);
+                };
+                document.body.appendChild(script);
+            },
+
+            fetchTiantian(code) {
+                window.jsonpgz = (data) => {
+                    if(data && data.fundcode) {
+                        this.updateData(data.fundcode, {
+                            name: data.name, basePrice: data.dwjz, baseDate: data.jzrq.substring(5),
+                            currentPrice: data.gsz, currentTime: data.gztime.substring(5), gszzl: data.gszzl, source: '估值'
+                        });
+                    }
+                };
+                const script = document.createElement('script');
+                script.src = `https://fundgz.1234567.com.cn/js/${code}.js?rt=${Date.now()}`;
+                document.body.appendChild(script);
+                setTimeout(() => { if(document.body.contains(script)) document.body.removeChild(script); }, 1500);
+            },
+
+            updateData(code, info) {
+                const exist = this.fundData[code];
+                if (exist && exist.currentTime === '今日实际' && info.source === '估值') return;
+                const gz = info.gszzl || (((Number(info.currentPrice)-Number(info.basePrice))/Number(info.basePrice))*100).toFixed(2);
+                this.$set(this.fundData, code, { ...info, gszzl: gz });
+            },
+
+            loadData() {
+                const data = localStorage.getItem('guguji_v5374_data');
+                this.portfolios = data ? JSON.parse(data) : [{ name: '我的持仓', funds: [] }];
+            },
+            save() { localStorage.setItem('guguji_v5374_data', JSON.stringify(this.portfolios)); },
+            addPortfolio() { const name = prompt("名称"); if(name) { this.portfolios.push({ name, funds: [] }); this.save(); } },
+            removePortfolio() { if(confirm("删除整个组合？")) { this.portfolios.splice(this.currentTab, 1); this.currentTab = 'all'; this.save(); } },
+            addFund() {
+                if(!this.newFund.code) return;
+                let c = this.newFund.code.trim(); while(c.length < 6) c = '0' + c;
+                this.portfolios[this.currentTab].funds.push({ code: c, shares: Number(this.newFund.shares||0), cost: Number(this.newFund.cost||0) });
+                this.newFund = { code: '', shares: null, cost: null };
+                this.save(); this.refreshAll();
+            },
+            deleteFund(code) { this.portfolios[this.currentTab].funds = this.portfolios[this.currentTab].funds.filter(f => f.code !== code); this.save(); }
+        },
+        created() { this.loadData(); },
+        mounted() { this.refreshAll(); setInterval(this.refreshAll, 60000); }
+    });
+</script>
+</body>
+</html>

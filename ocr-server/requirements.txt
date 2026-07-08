@@ -1,0 +1,6 @@
+flask>=3.0
+flask-cors>=4.0
+paddlepaddle>=2.6
+paddleocr>=2.8
+Pillow>=10.0
+requests>=2.31

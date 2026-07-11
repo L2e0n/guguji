@@ -16,7 +16,9 @@ import re
 import json
 import hmac
 import logging
+import time
 from difflib import SequenceMatcher
+from functools import lru_cache
 from pathlib import Path
 
 from flask import Flask, request, jsonify
@@ -65,6 +67,8 @@ FUND_CODE_MAP_PATH = Path(__file__).parent / "fund_codes.json"
 _fund_code_map = None
 _fund_catalog = None
 FUND_CATALOG_URL = "https://fund.eastmoney.com/js/fundcode_search.js"
+FUND_CATALOG_CACHE_PATH = Path("/tmp/guguji_fund_catalog.json")
+FUND_CATALOG_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 
 def load_fund_map():
     global _fund_code_map
@@ -102,6 +106,15 @@ def load_fund_catalog() -> list[dict]:
     global _fund_catalog
     if _fund_catalog is not None:
         return _fund_catalog
+    if FUND_CATALOG_CACHE_PATH.exists():
+        age = max(0, time.time() - FUND_CATALOG_CACHE_PATH.stat().st_mtime)
+        if age < FUND_CATALOG_MAX_AGE_SECONDS:
+            try:
+                _fund_catalog = json.loads(FUND_CATALOG_CACHE_PATH.read_text(encoding="utf-8"))
+                log.info("已从本地缓存加载 %d 条基金目录", len(_fund_catalog))
+                return _fund_catalog
+            except (OSError, json.JSONDecodeError):
+                pass
     try:
         resp = requests.get(
             FUND_CATALOG_URL,
@@ -121,6 +134,8 @@ def load_fund_catalog() -> list[dict]:
             for row in json.loads(match.group(1))
             if len(row) >= 3 and is_fund_code(str(row[0]))
         ]
+        FUND_CATALOG_CACHE_PATH.write_text(json.dumps(_fund_catalog, ensure_ascii=False), encoding="utf-8")
+        os.chmod(FUND_CATALOG_CACHE_PATH, 0o600)
         log.info("已加载 %d 条基金目录", len(_fund_catalog))
     except Exception as e:
         log.warning("基金目录加载失败: %s", e)
@@ -128,6 +143,7 @@ def load_fund_catalog() -> list[dict]:
     return _fund_catalog
 
 
+@lru_cache(maxsize=4096)
 def lookup_fund_nav(code: str) -> float:
     """按已确认基金代码查询净值，不使用模糊名称搜索结果。"""
     try:

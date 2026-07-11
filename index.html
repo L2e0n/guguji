@@ -51,6 +51,23 @@
     .fund-link { cursor:pointer; }
     .fund-link:hover { color:var(--primary); text-decoration:underline; }
     .fund-name-wrap { display:flex; align-items:center; gap:4px; }
+    .status-strip { display:flex; gap:8px; flex-wrap:wrap; margin:10px 0 15px; }
+    .status-pill { background:#fff7da; border:1px solid #ffe082; color:#8a6d1f; border-radius:999px; padding:5px 10px; font-size:11px; }
+    .status-pill.ok { background:#ecfff1; border-color:#b7e4c7; color:#206c39; }
+    .status-pill.warn { background:#fff3f0; border-color:#ffd2c7; color:#a34a2c; }
+    .ocr-grid { display:grid; grid-template-columns: 28px 88px minmax(120px, 1fr) 90px 90px; gap:8px; align-items:center; margin-bottom:8px; }
+    .ocr-grid.header { color:#888; font-size:11px; font-weight:bold; }
+    .ocr-grid input[type="text"], .ocr-grid input[type="number"] { width:100%; box-sizing:border-box; padding:7px 8px; border:1px solid #ffe082; border-radius:8px; font-size:12px; }
+    .ocr-grid .ocr-name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12px; }
+    .ocr-raw { background:#fffdf6; border:1px solid #fff0c2; border-radius:10px; padding:10px; font-size:11px; color:#7a6b3c; max-height:140px; overflow:auto; line-height:1.5; }
+    .ocr-actions { display:flex; justify-content:space-between; gap:8px; margin-top:12px; }
+    .ocr-empty { text-align:center; padding:24px 10px; color:#aaa; font-size:12px; }
+    @media (max-width: 720px) {
+      .summary-grid { grid-template-columns: 1fr; }
+      .stat-item { border-right:none; border-bottom:1px solid #fff3e0; padding-bottom:10px; }
+      .stat-item:last-child { border-bottom:none; padding-bottom:0; }
+      .ocr-grid { grid-template-columns: 28px 72px minmax(90px, 1fr) 72px 72px; }
+    }
   </style>
 </head>
 <body>
@@ -59,6 +76,11 @@
   <div class="header">
     <h1>🐤 <span>咕咕鸡</span>大作战 <small style="font-size:11px;color:#ccc;">v5.5.1</small></h1>
     <p style="font-size:11px;color:#999;"> 咕咕咕</p>
+  </div>
+
+  <div class="status-strip">
+    <div class="status-pill">{{ status }}</div>
+    <div class="status-pill" :class="ocrStatus.ready ? 'ok' : 'warn'">{{ ocrStatus.message }}</div>
   </div>
 
   <div class="card summary-grid">
@@ -98,6 +120,11 @@
       <label class="btn" style="background:#2e7d32;color:#fff;margin-left:10px;">
         📊 Excel 导入
         <input type="file" style="display:none" @change="importExcel" accept=".xlsx,.xls">
+      </label>
+
+      <label class="btn" style="background:#8d6e63;color:#fff;">
+        📷 截图导入
+        <input type="file" style="display:none" @change="importOcrImage" accept="image/*">
       </label>
 
       <button class="btn" style="background:#f5f5f5;color:#999;margin-left:auto;" @click="removePortfolio">删除组</button>
@@ -176,6 +203,42 @@
     </div>
   </div>
 
+  <div class="modal-overlay" v-if="ocrModal.show" @click.self="closeOcrModal">
+    <div class="modal-card">
+      <span class="modal-close" @click="closeOcrModal">&times;</span>
+      <h3>截图导入持仓</h3>
+      <div v-if="ocrModal.loading" class="ocr-empty">OCR 识别中，首次调用可能会稍慢。</div>
+      <div v-else-if="ocrModal.error" class="ocr-empty">{{ ocrModal.error }}</div>
+      <template v-else>
+        <div class="ocr-grid header">
+          <div>选</div>
+          <div>代码</div>
+          <div>基金名</div>
+          <div>份额</div>
+          <div>成本</div>
+        </div>
+        <div v-if="ocrModal.items.length">
+          <div class="ocr-grid" v-for="(item, index) in ocrModal.items" :key="item.id || index">
+            <input type="checkbox" v-model="item.selected">
+            <input type="text" v-model.trim="item.code" maxlength="6" placeholder="代码">
+            <div class="ocr-name">{{ item.name || '待确认基金名' }}</div>
+            <input type="number" v-model.number="item.shares" placeholder="份额" min="0" step="0.01">
+            <input type="number" v-model.number="item.cost" placeholder="成本" min="0" step="0.0001">
+          </div>
+        </div>
+        <div v-else class="ocr-empty">没识别出可导入的基金，请换更清晰的截图重试。</div>
+
+        <div style="margin-top:14px;font-size:11px;color:#999;">OCR 原文</div>
+        <div class="ocr-raw">{{ ocrModal.rawTextPreview || '无原文' }}</div>
+
+        <div class="ocr-actions">
+          <button class="btn" style="background:#f5f5f5;color:#666;" @click="closeOcrModal">取消</button>
+          <button class="btn" style="background:var(--secondary);color:#fff;" @click="applyOcrImport">导入所选基金</button>
+        </div>
+      </template>
+    </div>
+  </div>
+
   <div class="footer">&copy; 2026-2028 咕咕鸡大作战 v5.5.1 | 数据源: 天天基金/东方财富/新浪</div>
 </div>
 
@@ -190,11 +253,13 @@ new Vue({
     proxyBase: 'https://api.guguji.icu',
 
     portfolios: JSON.parse(localStorage.getItem('guguji_v540_data')) || JSON.parse(localStorage.getItem('guguji_v5392_data')) || [{ name: '主要投资', funds: [] }],
-    fundData: {},
+    fundData: JSON.parse(localStorage.getItem('guguji_fund_cache') || '{}'),
 
     timer: null,
 
-    historyModal: { show: false, code: '', name: '', records: [] }
+    historyModal: { show: false, code: '', name: '', records: [] },
+    ocrStatus: { ready: false, message: 'OCR 服务检查中...' },
+    ocrModal: { show: false, loading: false, error: '', items: [], rawTextPreview: '' }
   },
 
   computed: {
@@ -257,6 +322,10 @@ new Vue({
     async refreshAll() {
       const codes = new Set();
       this.portfolios.forEach(p => p.funds && p.funds.forEach(f => codes.add(f.code)));
+      if (!codes.size) {
+        this.status = '当前组合为空';
+        return;
+      }
       codes.forEach(code => this.fetchFund(code));
       this.status = "校准成功: " + new Date().toLocaleTimeString('zh-CN');
     },
@@ -289,6 +358,7 @@ new Vue({
           gszzl: data.gszzl,
           source: '估值'
         });
+        this.persistFundCache();
       };
     },
 
@@ -356,6 +426,7 @@ new Vue({
       const gzStr = (Math.abs(gzNum) < 0.001) ? '0.00' : gz;
 
       this.$set(this.fundData, code, { ...info, gszzl: gzStr });
+      this.persistFundCache();
     },
 
     fetchSina(code) {
@@ -395,6 +466,7 @@ new Vue({
         if (name) {
           const exist = this.fundData[code] || {};
           this.$set(this.fundData, code, { ...exist, name });
+          this.persistFundCache();
         }
       };
       script.onerror = () => script.remove();
@@ -433,6 +505,94 @@ new Vue({
 
     closeHistory() {
       this.historyModal.show = false;
+    },
+
+    async checkOcrHealth() {
+      try {
+        const resp = await fetch(`${this.proxyBase}/ocr/health`, { cache: 'no-store' });
+        if (!resp.ok) throw new Error('health_check_failed');
+        const data = await resp.json();
+        this.ocrStatus = {
+          ready: !!(data && data.ok),
+          message: data && data.ok ? 'OCR 可用，支持截图识别导入' : 'OCR 暂不可用'
+        };
+      } catch (err) {
+        this.ocrStatus = { ready: false, message: 'OCR 未配置，先保留 Excel 导入' };
+      }
+    },
+
+    normalizeFundCode(code) {
+      const raw = String(code || '').replace(/\D/g, '');
+      return raw ? raw.padStart(6, '0').slice(-6) : '';
+    },
+
+    persistFundCache() {
+      try {
+        localStorage.setItem('guguji_fund_cache', JSON.stringify(this.fundData));
+      } catch (e) {}
+    },
+
+    resetOcrModal() {
+      this.ocrModal = { show: false, loading: false, error: '', items: [], rawTextPreview: '' };
+    },
+
+    closeOcrModal() {
+      this.resetOcrModal();
+    },
+
+    async importOcrImage(e) {
+      const file = e.target.files[0];
+      e.target.value = '';
+      if (!file) return;
+      if (this.currentTab === 'all') return alert('请先进入具体组合页再导入截图');
+
+      this.ocrModal = { show: true, loading: true, error: '', items: [], rawTextPreview: '' };
+
+      try {
+        const form = new FormData();
+        form.append('image', file);
+
+        const resp = await fetch(`${this.proxyBase}/ocr`, {
+          method: 'POST',
+          body: form
+        });
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.error || '识别失败');
+
+        const funds = Array.isArray(data.funds) ? data.funds : [];
+        this.ocrModal.loading = false;
+        this.ocrModal.items = funds.map((item, index) => ({
+          id: `${Date.now()}_${index}`,
+          selected: true,
+          code: this.normalizeFundCode(item.code),
+          name: item.name || '',
+          shares: Number(item.shares || 0),
+          cost: Number(item.cost || 0)
+        }));
+        this.ocrModal.rawTextPreview = Array.isArray(data.raw_text) ? data.raw_text.join(' / ') : '';
+      } catch (err) {
+        this.ocrModal.loading = false;
+        this.ocrModal.error = err.message || 'OCR 服务异常';
+      }
+    },
+
+    applyOcrImport() {
+      if (this.currentTab === 'all') return;
+      const picked = this.ocrModal.items
+        .filter(item => item.selected && /^\d{6}$/.test(this.normalizeFundCode(item.code)))
+        .map(item => ({
+          code: this.normalizeFundCode(item.code),
+          shares: Number(item.shares || 0),
+          cost: Number(item.cost || 0)
+        }));
+
+      if (!picked.length) return alert('至少保留一条有效基金代码');
+
+      this.portfolios[this.currentTab].funds.push(...picked);
+      this.save();
+      this.refreshAll();
+      this.closeOcrModal();
+      alert(`已导入 ${picked.length} 条持仓`);
     },
 
     importExcel(e) {
@@ -530,6 +690,7 @@ new Vue({
 
   mounted() {
     this.initTiantianJsonp();
+    this.checkOcrHealth();
     this.refreshAll();
     this.timer = setInterval(this.refreshAll, 60000);
   },

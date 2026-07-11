@@ -16,6 +16,7 @@ import re
 import json
 import hmac
 import logging
+from difflib import SequenceMatcher
 from pathlib import Path
 
 from flask import Flask, request, jsonify
@@ -62,6 +63,8 @@ def get_ocr():
 # ── 基金代码 → 名称 简易映射 ──
 FUND_CODE_MAP_PATH = Path(__file__).parent / "fund_codes.json"
 _fund_code_map = None
+_fund_catalog = None
+FUND_CATALOG_URL = "https://fund.eastmoney.com/js/fundcode_search.js"
 
 def load_fund_map():
     global _fund_code_map
@@ -78,35 +81,106 @@ def load_fund_map():
 
 
 # ── 在线查询基金代码 ──
-def lookup_fund(name: str) -> dict | None:
-    """通过东财搜索接口按名称查询基金代码和最新净值。"""
-    normalized_name = normalize_fund_name(name)
+def canonical_fund_name(name: str) -> str:
+    """将 OCR 名称与基金目录中的常见异体统一。"""
+    name = normalize_fund_name(name)
+    name = re.sub(r"[·•，,。._-]", "", name)
+    return (
+        name.replace("发起式", "发起")
+        .replace("年期", "年")
+        .replace("国开行债券", "国开债")
+    )
+
+
+def fund_match_key(name: str) -> str:
+    """去除容易因改名而变化的通用后缀，保留基金名称的专有部分。"""
+    return re.sub(r"灵活配置|混合", "", canonical_fund_name(name))
+
+
+def load_fund_catalog() -> list[dict]:
+    """加载东财公开基金全量名录，避免搜索接口把股票或指数排在基金前面。"""
+    global _fund_catalog
+    if _fund_catalog is not None:
+        return _fund_catalog
+    try:
+        resp = requests.get(
+            FUND_CATALOG_URL,
+            timeout=15,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        match = re.search(r"var r\s*=\s*(\[.*\])\s*;?\s*$", resp.text, re.S)
+        if not match:
+            raise ValueError("基金目录格式异常")
+        _fund_catalog = [
+            {
+                "code": str(row[0]),
+                "name": row[2],
+                "key": canonical_fund_name(row[2]),
+                "match_key": fund_match_key(row[2]),
+            }
+            for row in json.loads(match.group(1))
+            if len(row) >= 3 and is_fund_code(str(row[0]))
+        ]
+        log.info("已加载 %d 条基金目录", len(_fund_catalog))
+    except Exception as e:
+        log.warning("基金目录加载失败: %s", e)
+        _fund_catalog = []
+    return _fund_catalog
+
+
+def lookup_fund_nav(code: str) -> float:
+    """按已确认基金代码查询净值，不使用模糊名称搜索结果。"""
     try:
         resp = requests.get(
             "https://fundsuggest.eastmoney.com/FundSearch/api/FundSearchAPI.ashx",
-            params={"m": "1", "key": name.strip()},
+            params={"m": "1", "key": code},
             timeout=5,
             headers={"User-Agent": "Mozilla/5.0"},
         )
-        candidates = resp.json().get("Datas", [])
-        if not candidates:
-            return None
-
-        # 优先精确名称，避免 A/C 类别基金被模糊搜索匹配到相邻产品。
         candidate = next(
-            (item for item in candidates if normalize_fund_name(item.get("NAME", "")) == normalized_name),
-            candidates[0],
+            (item for item in resp.json().get("Datas", []) if str(item.get("CODE", "")) == code),
+            None,
         )
-        base_info = candidate.get("FundBaseInfo") or {}
-        nav = base_info.get("DWJZ")
-        return {
-            "code": str(candidate.get("CODE", "")),
-            "name": candidate.get("NAME", name),
-            "nav": float(nav) if nav not in (None, "") else 0.0,
-        }
+        nav = (candidate or {}).get("FundBaseInfo", {}).get("DWJZ")
+        return float(nav) if nav not in (None, "") else 0.0
     except Exception as e:
-        log.warning(f"基金名称查询失败 [{name}]: {e}")
-    return None
+        log.warning("基金净值查询失败 [%s]: %s", code, e)
+        return 0.0
+
+
+def lookup_fund(name: str) -> dict | None:
+    """从基金名录精确或高置信匹配基金，不返回股票和指数代码。"""
+    key = canonical_fund_name(name)
+    if len(key) < 5:
+        return None
+    catalog = load_fund_catalog()
+    exact = next((item for item in catalog if item["key"] == key), None)
+    if exact is None:
+        prefix_matches = [item for item in catalog if item["key"].startswith(key) or key.startswith(item["key"])]
+        if len(prefix_matches) == 1:
+            exact = prefix_matches[0]
+        else:
+            # OCR 可能漏掉“主题”“发起式”等字；限制同一基金公司前缀并要求高相似度。
+            candidates = [item for item in catalog if item["key"][:2] == key[:2]]
+            search_key = fund_match_key(name)
+
+            def match_score(item: dict) -> float:
+                prefix = 0
+                for left, right in zip(search_key, item["match_key"]):
+                    if left != right:
+                        break
+                    prefix += 1
+                class_bonus = 0.12 if key[-1:] in "ABCD" and item["key"].endswith(key[-1:]) else 0
+                return SequenceMatcher(None, search_key, item["match_key"]).ratio() + min(prefix, 8) * 0.06 + class_bonus
+
+            scored = [(match_score(item), item) for item in candidates]
+            score, candidate = max(scored, default=(0.0, None), key=lambda pair: pair[0])
+            if score >= 0.74:
+                exact = candidate
+    if exact is None:
+        log.info("未匹配到基金名称: %s", name)
+        return None
+    return {"code": exact["code"], "name": exact["name"], "nav": lookup_fund_nav(exact["code"])}
 
 
 def normalize_fund_name(name: str) -> str:
@@ -159,7 +233,7 @@ def is_numeric(text: str) -> bool:
 
 def parse_number(text: str) -> float | None:
     """解析截图中带千分位和正负号的金额。"""
-    value = text.strip().replace(",", "").replace("+", "")
+    value = text.strip().replace(",", "").replace("+", "").replace("¥", "").replace("￥", "")
     return float(value) if is_numeric(value) else None
 
 
@@ -168,20 +242,44 @@ def looks_like_fund_name(text: str) -> bool:
     text = text.strip()
     if len(re.findall(r"[一-鿿]", text)) < 4:
         return False
-    if re.search(r"按最近|日收益|持有收益|偏债类|收起", text):
+    if re.search(r"按最近|日收益|持有收益|持仓基金|策略收益|偏债类|收起|查看全部", text):
         return False
-    return bool(re.search(r"基金|债券|混合|货币|指数|股票|联接|FOF|QDII", text, re.I))
+    return bool(re.search(r"基金|债券|短债|纯债|混合|货币|指数|股票|联接|FOF|QDII", text, re.I))
 
 
 def parse_named_holdings(items: list[dict], fund_map: dict) -> list[dict]:
     """解析不展示代码的持仓截图，按名称查询基金并反推份额和成本。"""
     name_cache: dict[str, dict | None] = {}
     funds = []
+    viewport_width = max((item["x"] for item in items), default=1)
+    name_rows = [item for item in items if looks_like_fund_name(item["text"].strip().lstrip("·• "))]
+    name_y_values = sorted(item["y"] for item in name_rows)
+    row_gaps = [b - a for a, b in zip(name_y_values, name_y_values[1:]) if b - a > 40]
+    default_card_height = sorted(row_gaps)[len(row_gaps) // 2] if row_gaps else 260
 
-    for item in items:
-        name = item["text"].strip()
+    for item_index, item in enumerate(items):
+        name = item["text"].strip().lstrip("·• ")
         if not looks_like_fund_name(name):
             continue
+
+        next_name_y = next((y for y in name_y_values if y > item["y"] + 30), None)
+        card_height = (next_name_y - item["y"]) if next_name_y else default_card_height
+        card_height = max(card_height, default_card_height * 0.6)
+
+        # 手机上的长基金名可能会换行，例如“...发起”下一行补“联接C”。
+        suffix = next(
+            (
+                other["text"].strip()
+                for other in items[item_index + 1:]
+                if 0 < other["y"] - item["y"] <= card_height * 0.55
+                and other["x"] < viewport_width * 0.48
+                and re.match(r"^[一-鿿A-Z()（）]+$", other["text"].strip())
+                and re.search(r"联接|[A-Z]$", other["text"].strip())
+            ),
+            "",
+        )
+        if suffix:
+            name += suffix
 
         normalized_name = normalize_fund_name(name)
         if normalized_name not in name_cache:
@@ -201,36 +299,62 @@ def parse_named_holdings(items: list[dict], fund_map: dict) -> list[dict]:
         # 这类持仓页会把持有金额放在基金名下一行、左侧同一列。
         amounts = [
             other for other in items
-            if 0 < other["y"] - item["y"] <= 100 and other["x"] < 600
+            if 0 < other["y"] - item["y"] <= card_height * 0.5
+            and other["x"] < viewport_width * 0.45
         ]
         amount_values = [parse_number(other["text"]) for other in amounts]
         market_value = next((value for value in amount_values if value is not None and value > 0), 0.0)
 
-        # 右侧“持有收益”可用于由持有金额反推成本价。
-        profits = [
+        # 不同手机截图宽度不同，按基金名右侧同一行的数值列取日收益和持有收益。
+        card_row = [
             other for other in items
-            if abs(other["y"] - item["y"]) <= 35 and other["x"] > 1150
+            if -card_height * 0.15 <= other["y"] - item["y"] <= card_height * 0.45
         ]
-        profit_values = [parse_number(other["text"]) for other in profits]
-        holding_profit = next((value for value in profit_values if value is not None), 0.0)
+        day_numbers = sorted(
+            (
+                (other["x"], value) for other in card_row
+                if viewport_width * 0.45 <= other["x"] < viewport_width * 0.80
+                and (value := parse_number(other["text"])) is not None
+            ),
+            key=lambda pair: pair[0],
+        )
+        holding_numbers = sorted(
+            (
+                (other["x"], value) for other in card_row
+                if other["x"] >= viewport_width * 0.80
+                and (value := parse_number(other["text"])) is not None
+            ),
+            key=lambda pair: pair[0],
+        )
+        day_profit = day_numbers[0][1] if day_numbers else 0.0
+        holding_profit = holding_numbers[0][1] if holding_numbers else None
 
-        day_profits = [
-            other for other in items
-            if abs(other["y"] - item["y"]) <= 35 and 750 < other["x"] < 1150
-        ]
-        day_profit_values = [parse_number(other["text"]) for other in day_profits]
-        day_profit = next((value for value in day_profit_values if value is not None), 0.0)
+        row_rates = sorted(
+            (
+                (other["x"], parse_number(other["text"].replace("%", "")))
+                for other in items
+                if 0 < other["y"] - item["y"] <= card_height * 0.65
+                and viewport_width * 0.45 <= other["x"] < viewport_width * 0.80
+                and other["text"].strip().endswith("%")
+            ),
+            key=lambda pair: pair[0],
+        )
+        day_rate = row_rates[0][1] if row_rates else None
 
         dates = [
-            other["text"] for other in items
-            if 0 < other["y"] - item["y"] <= 70 and 750 < other["x"] < 1150
-            and re.match(r"^\d{2}-\d{2}$", other["text"].strip())
+            match.group(1) for other in items
+            if 0 < other["y"] - item["y"] <= card_height * 0.85
+            and other["x"] >= viewport_width * 0.70
+            and (match := re.search(r"(\d{2}-\d{2})", other["text"]))
         ]
         snapshot_date = dates[0] if dates else ""
 
         nav = float(matched.get("nav") or 0)
+        # 且慢“策略收益明细”只给日收益率和日收益，可反推当日持有金额。
+        if market_value <= 0 and day_rate not in (None, 0) and day_profit:
+            market_value = abs(day_profit / (day_rate / 100))
         shares = market_value / nav if market_value > 0 and nav > 0 else 0.0
-        cost = (market_value - holding_profit) / shares if shares > 0 else 0.0
+        cost = (market_value - holding_profit) / shares if shares > 0 and holding_profit is not None else 0.0
         fund = {"code": matched["code"], "name": matched.get("name") or name}
         if shares > 0:
             fund["shares"] = round(shares, 2)

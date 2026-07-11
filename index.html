@@ -573,7 +573,7 @@ new Vue({
           code: this.normalizeFundCode(item.code),
           name: item.name || '',
           shares: Number(item.shares || 0),
-          cost: Number(item.cost || 0),
+          cost: item.cost == null ? null : Number(item.cost),
           snapshotCurrentPrice: Number(item.snapshot_current_price || 0),
           snapshotBasePrice: Number(item.snapshot_base_price || 0),
           snapshotDate: item.snapshot_date || ''
@@ -593,7 +593,7 @@ new Vue({
           code: this.normalizeFundCode(item.code),
           name: item.name || '',
           shares: Number(item.shares || 0),
-          cost: Number(item.cost || 0),
+          cost: item.cost == null ? 0 : Number(item.cost),
           snapshotCurrentPrice: Number(item.snapshotCurrentPrice || 0),
           snapshotBasePrice: Number(item.snapshotBasePrice || 0),
           snapshotDate: item.snapshotDate || ''

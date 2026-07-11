@@ -25,6 +25,9 @@ import requests
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("guguji-ocr")
 
+# Paddle 3.x CPU runtime can fail on some hosts unless PIR is disabled.
+os.environ.setdefault("FLAGS_enable_pir_api", "0")
+
 app = Flask(__name__)
 CORS(app)
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16MB
@@ -39,10 +42,10 @@ def get_ocr():
         log.info("正在加载 PaddleOCR 模型(首次加载较慢)...")
         from paddleocr import PaddleOCR
         try:
-            _ocr = PaddleOCR(use_angle_cls=True, lang="ch", show_log=False)
+            _ocr = PaddleOCR(use_angle_cls=False, lang="ch", show_log=False, enable_mkldnn=False)
         except (TypeError, ValueError):
             # Newer PaddleOCR builds removed some legacy kwargs such as show_log.
-            _ocr = PaddleOCR(use_angle_cls=True, lang="ch")
+            _ocr = PaddleOCR(use_angle_cls=False, lang="ch", enable_mkldnn=False)
         log.info("PaddleOCR 模型加载完成")
     return _ocr
 
@@ -99,7 +102,7 @@ def normalize_fund_name(name: str) -> str:
 def ocr_image(image_path: str) -> list[dict]:
     """对图片进行 OCR, 返回按 y 坐标排序的文本块列表"""
     ocr = get_ocr()
-    result = ocr.ocr(image_path, cls=True)
+    result = ocr.ocr(image_path)
     if not result or not result[0]:
         return []
 

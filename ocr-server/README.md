@@ -11,6 +11,8 @@ pip install -r requirements.txt
 python app.py
 ```
 
+服务端代码已经兼容较新的 PaddleOCR 3.x，并在 CPU 环境下默认关闭 `mkldnn`、禁用 PIR API，避免部分主机上的推理异常。
+
 ## Docker 运行
 
 ```bash

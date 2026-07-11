@@ -38,7 +38,11 @@ def get_ocr():
     if _ocr is None:
         log.info("正在加载 PaddleOCR 模型(首次加载较慢)...")
         from paddleocr import PaddleOCR
-        _ocr = PaddleOCR(use_angle_cls=True, lang="ch", show_log=False)
+        try:
+            _ocr = PaddleOCR(use_angle_cls=True, lang="ch", show_log=False)
+        except TypeError:
+            # Newer PaddleOCR builds removed some legacy kwargs such as show_log.
+            _ocr = PaddleOCR(use_angle_cls=True, lang="ch")
         log.info("PaddleOCR 模型加载完成")
     return _ocr
 

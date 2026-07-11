@@ -69,25 +69,34 @@ def load_fund_map():
 
 
 # ── 在线查询基金代码 ──
-def lookup_fund_code(name: str) -> str | None:
-    """通过天天基金搜索接口查询基金代码"""
+def lookup_fund(name: str) -> dict | None:
+    """通过东财搜索接口按名称查询基金代码和最新净值。"""
+    normalized_name = normalize_fund_name(name)
     try:
-        import urllib.parse
         resp = requests.get(
-            f"https://fundgz.1234567.com.cn/js/",
-            params={"fundname": name.strip()},
+            "https://fundsuggest.eastmoney.com/FundSearch/api/FundSearchAPI.ashx",
+            params={"m": "1", "key": name.strip()},
             timeout=5,
-            headers={"User-Agent": "Mozilla/5.0"}
+            headers={"User-Agent": "Mozilla/5.0"},
         )
-        # 天天基金搜索接口返回 JSONP
-        text = resp.text
-        m = re.search(r'jsonpgz\(([\s\S]*)\)', text)
-        if m:
-            data = json.loads(m.group(1))
-            if isinstance(data, list) and len(data) > 0:
-                return str(data[0].get("code", ""))
+        candidates = resp.json().get("Datas", [])
+        if not candidates:
+            return None
+
+        # 优先精确名称，避免 A/C 类别基金被模糊搜索匹配到相邻产品。
+        candidate = next(
+            (item for item in candidates if normalize_fund_name(item.get("NAME", "")) == normalized_name),
+            candidates[0],
+        )
+        base_info = candidate.get("FundBaseInfo") or {}
+        nav = base_info.get("DWJZ")
+        return {
+            "code": str(candidate.get("CODE", "")),
+            "name": candidate.get("NAME", name),
+            "nav": float(nav) if nav not in (None, "") else 0.0,
+        }
     except Exception as e:
-        log.warning(f"在线查询失败 [{name}]: {e}")
+        log.warning(f"基金名称查询失败 [{name}]: {e}")
     return None
 
 
@@ -137,6 +146,76 @@ def is_fund_code(text: str) -> bool:
 def is_numeric(text: str) -> bool:
     """是否为数值(带可选负号和小数点)"""
     return bool(re.match(r'^-?\d+(\.\d+)?$', text.strip().replace(",", "")))
+
+
+def parse_number(text: str) -> float | None:
+    """解析截图中带千分位和正负号的金额。"""
+    value = text.strip().replace(",", "").replace("+", "")
+    return float(value) if is_numeric(value) else None
+
+
+def looks_like_fund_name(text: str) -> bool:
+    """排除收益列和分类标题，保留可能的基金产品名称。"""
+    text = text.strip()
+    if len(re.findall(r"[一-鿿]", text)) < 4:
+        return False
+    if re.search(r"按最近|日收益|持有收益|偏债类|收起", text):
+        return False
+    return bool(re.search(r"基金|债券|混合|货币|指数|股票|联接|FOF|QDII", text, re.I))
+
+
+def parse_named_holdings(items: list[dict], fund_map: dict) -> list[dict]:
+    """解析不展示代码的持仓截图，按名称查询基金并反推份额和成本。"""
+    name_cache: dict[str, dict | None] = {}
+    funds = []
+
+    for item in items:
+        name = item["text"].strip()
+        if not looks_like_fund_name(name):
+            continue
+
+        normalized_name = normalize_fund_name(name)
+        if normalized_name not in name_cache:
+            mapped = next(
+                (
+                    {"code": code, "name": mapped_name, "nav": 0.0}
+                    for code, mapped_name in fund_map.items()
+                    if normalize_fund_name(mapped_name) == normalized_name
+                ),
+                None,
+            )
+            name_cache[normalized_name] = mapped or lookup_fund(name)
+        matched = name_cache[normalized_name]
+        if not matched or not is_fund_code(matched.get("code", "")):
+            continue
+
+        # 这类持仓页会把持有金额放在基金名下一行、左侧同一列。
+        amounts = [
+            other for other in items
+            if 0 < other["y"] - item["y"] <= 100 and other["x"] < 600
+        ]
+        amount_values = [parse_number(other["text"]) for other in amounts]
+        market_value = next((value for value in amount_values if value is not None and value > 0), 0.0)
+
+        # 右侧“持有收益”可用于由持有金额反推成本价。
+        profits = [
+            other for other in items
+            if abs(other["y"] - item["y"]) <= 35 and other["x"] > 1150
+        ]
+        profit_values = [parse_number(other["text"]) for other in profits]
+        holding_profit = next((value for value in profit_values if value is not None), 0.0)
+
+        nav = float(matched.get("nav") or 0)
+        shares = market_value / nav if market_value > 0 and nav > 0 else 0.0
+        cost = (market_value - holding_profit) / shares if shares > 0 else 0.0
+        fund = {"code": matched["code"], "name": matched.get("name") or name}
+        if shares > 0:
+            fund["shares"] = round(shares, 2)
+        if cost > 0:
+            fund["cost"] = round(cost, 4)
+        funds.append(fund)
+
+    return funds
 
 
 def parse_ocr_to_funds(items: list[dict]) -> list[dict]:
@@ -224,21 +303,9 @@ def parse_ocr_to_funds(items: list[dict]) -> list[dict]:
 
         funds.append(fund)
 
-    # 策略2: 如果没找到任何代码, 尝试按布局分组
+    # 策略2: 截图仅展示基金名称时，按名称反查代码并读取持有金额。
     if not funds:
-        current_name = ""
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-            # 如果是中文字符为主, 可能是基金名称
-            cn_chars = len(re.findall(r'[一-鿿]', line))
-            if cn_chars > 2 and is_fund_code not in [is_fund_code(l) for l in [line]]:
-                current_name = line
-            elif is_fund_code(line):
-                code = line
-                name = fund_map.get(code, current_name)
-                funds.append({"code": code, "name": name, "shares": 0, "cost": 0.0})
+        funds = parse_named_holdings(items, fund_map)
 
     return funds
 

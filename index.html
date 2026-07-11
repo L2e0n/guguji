@@ -14,6 +14,8 @@
     .card { background: #fff; border-radius: 16px; padding: 15px; box-shadow: 0 8px 20px rgba(251, 192, 45, 0.05); margin-bottom: 15px; border: 1px solid #ffecb3; }
     .header { text-align: center; margin-bottom: 15px; }
     .header h1 { color: var(--secondary); margin: 0; font-size: 22px; }
+    .home-link { display:inline-flex; align-items:center; margin-bottom:8px; color:var(--secondary); font-size:11px; font-weight:bold; text-decoration:none; }
+    .home-link:hover { color:#8d6e63; text-decoration:underline; }
     .summary-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
     .stat-item { text-align: center; border-right: 1px solid #fff3e0; }
     .stat-item:last-child { border-right: none; }
@@ -74,6 +76,7 @@
 
 <div id="app" class="app-container" v-cloak>
   <div class="header">
+    <a class="home-link" href="https://guguji.icu">← 返回主页</a>
     <h1>🐤 <span>咕咕鸡</span>大作战 <small style="font-size:11px;color:#ccc;">v5.5.1</small></h1>
     <p style="font-size:11px;color:#999;"> 咕咕咕</p>
   </div>

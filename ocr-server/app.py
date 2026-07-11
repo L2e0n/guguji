@@ -14,6 +14,7 @@
 import os
 import re
 import json
+import hmac
 import logging
 from pathlib import Path
 
@@ -29,12 +30,20 @@ log = logging.getLogger("guguji-ocr")
 os.environ.setdefault("FLAGS_enable_pir_api", "0")
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, resources={r"/api/*": {"origins": ["https://ji.guguji.icu"]}})
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16MB
 app.config["UPLOAD_FOLDER"] = "/tmp/guguji_ocr"
+Image.MAX_IMAGE_PIXELS = 20_000_000
 
 # PaddleOCR (延迟加载, 首次请求时初始化)
 _ocr = None
+
+
+def has_valid_worker_token() -> bool:
+    """仅允许 Cloudflare Worker 调用公开 Tunnel 后的 OCR 接口。"""
+    secret = os.environ.get("OCR_SHARED_SECRET", "")
+    provided = request.headers.get("X-OCR-Token", "")
+    return bool(secret) and hmac.compare_digest(provided, secret)
 
 def get_ocr():
     global _ocr
@@ -333,12 +342,17 @@ def parse_ocr_to_funds(items: list[dict]) -> list[dict]:
 # ── API 路由 ──
 @app.route("/health", methods=["GET"])
 def health():
+    if not has_valid_worker_token():
+        return jsonify({"error": "unauthorized"}), 403
     return jsonify({"status": "ok"})
 
 
 @app.route("/api/ocr", methods=["POST"])
 def ocr_upload():
     """接收图片, 返回识别的基金持仓数据"""
+    if not has_valid_worker_token():
+        return jsonify({"error": "unauthorized", "funds": []}), 403
+
     if "image" not in request.files:
         return jsonify({"error": "请上传图片", "funds": []}), 400
 
@@ -346,11 +360,13 @@ def ocr_upload():
     if not file.filename:
         return jsonify({"error": "文件名为空", "funds": []}), 400
 
-    os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
+    os.makedirs(app.config["UPLOAD_FOLDER"], mode=0o700, exist_ok=True)
+    os.chmod(app.config["UPLOAD_FOLDER"], 0o700)
     ext = os.path.splitext(file.filename)[1] or ".png"
     save_path = os.path.join(app.config["UPLOAD_FOLDER"], f"ocr_{os.urandom(4).hex()}{ext}")
     file.save(save_path)
-    log.info(f"收到图片: {file.filename} -> {save_path}")
+    os.chmod(save_path, 0o600)
+    log.info("收到 OCR 图片")
 
     try:
         # 压缩大图片
@@ -374,17 +390,19 @@ def ocr_upload():
         funds = parse_ocr_to_funds(items)
         log.info(f"解析出 {len(funds)} 个基金")
 
-        # 清理临时文件
-        try:
-            os.remove(save_path)
-        except Exception:
-            pass
-
         return jsonify({"funds": funds, "raw_text": [i["text"] for i in items]})
 
     except Exception as e:
         log.exception("OCR 处理出错")
         return jsonify({"error": f"识别失败: {str(e)}", "funds": []}), 500
+    finally:
+        # 无论识别成功、无文字或异常都不保留用户上传的图片。
+        try:
+            os.remove(save_path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            log.warning("临时 OCR 图片清理失败")
 
 
 @app.route("/api/lookup", methods=["GET"])

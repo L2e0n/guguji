@@ -343,6 +343,8 @@ new Vue({
         const code = data.fundcode;
 
         const exist = this.fundData[code] || {};
+        const quoteDate = (data.gztime || '').substring(5, 10);
+        if (exist.source === '截图' && exist.snapshotDate && (!quoteDate || quoteDate <= exist.snapshotDate)) return;
         if (exist.currentTime === '今日已出' || exist.source === '行情') return;
 
         const dwjz = Number(data.dwjz);
@@ -411,6 +413,7 @@ new Vue({
       const exist = this.fundData[code] || {};
 
       // 行情(东财) > 估值(天天) > 官方(新浪)
+      if (exist.source === '截图') return;
       if (exist.source === '行情' && info.source !== '行情') return;
       if (exist.source === '估值' && info.source === '官方') return;
 
@@ -567,7 +570,10 @@ new Vue({
           code: this.normalizeFundCode(item.code),
           name: item.name || '',
           shares: Number(item.shares || 0),
-          cost: Number(item.cost || 0)
+          cost: Number(item.cost || 0),
+          snapshotCurrentPrice: Number(item.snapshot_current_price || 0),
+          snapshotBasePrice: Number(item.snapshot_base_price || 0),
+          snapshotDate: item.snapshot_date || ''
         }));
         this.ocrModal.rawTextPreview = Array.isArray(data.raw_text) ? data.raw_text.join(' / ') : '';
       } catch (err) {
@@ -582,14 +588,39 @@ new Vue({
         .filter(item => item.selected && /^\d{6}$/.test(this.normalizeFundCode(item.code)))
         .map(item => ({
           code: this.normalizeFundCode(item.code),
+          name: item.name || '',
           shares: Number(item.shares || 0),
-          cost: Number(item.cost || 0)
+          cost: Number(item.cost || 0),
+          snapshotCurrentPrice: Number(item.snapshotCurrentPrice || 0),
+          snapshotBasePrice: Number(item.snapshotBasePrice || 0),
+          snapshotDate: item.snapshotDate || ''
         }));
 
       if (!picked.length) return alert('至少保留一条有效基金代码');
 
-      this.portfolios[this.currentTab].funds.push(...picked);
+      const portfolioFunds = this.portfolios[this.currentTab].funds;
+      picked.forEach(item => {
+        const record = { code: item.code, shares: item.shares, cost: item.cost };
+        const existingIndex = portfolioFunds.findIndex(f => f.code === item.code);
+        if (existingIndex >= 0) portfolioFunds.splice(existingIndex, 1, record);
+        else portfolioFunds.push(record);
+      });
+      picked.forEach(item => {
+        if (item.snapshotCurrentPrice <= 0 || item.snapshotBasePrice <= 0) return;
+        const existing = this.fundData[item.code] || {};
+        this.$set(this.fundData, item.code, {
+          ...existing,
+          name: item.name || existing.name || item.code,
+          currentPrice: item.snapshotCurrentPrice.toFixed(4),
+          basePrice: item.snapshotBasePrice.toFixed(4),
+          baseDate: item.snapshotDate || '截图',
+          currentTime: item.snapshotDate ? `${item.snapshotDate} 截图` : '截图',
+          source: '截图',
+          snapshotDate: item.snapshotDate
+        });
+      });
       this.save();
+      this.persistFundCache();
       this.refreshAll();
       this.closeOcrModal();
       alert(`已导入 ${picked.length} 条持仓`);

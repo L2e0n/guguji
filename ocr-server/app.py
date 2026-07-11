@@ -205,6 +205,20 @@ def parse_named_holdings(items: list[dict], fund_map: dict) -> list[dict]:
         profit_values = [parse_number(other["text"]) for other in profits]
         holding_profit = next((value for value in profit_values if value is not None), 0.0)
 
+        day_profits = [
+            other for other in items
+            if abs(other["y"] - item["y"]) <= 35 and 750 < other["x"] < 1150
+        ]
+        day_profit_values = [parse_number(other["text"]) for other in day_profits]
+        day_profit = next((value for value in day_profit_values if value is not None), 0.0)
+
+        dates = [
+            other["text"] for other in items
+            if 0 < other["y"] - item["y"] <= 70 and 750 < other["x"] < 1150
+            and re.match(r"^\d{2}-\d{2}$", other["text"].strip())
+        ]
+        snapshot_date = dates[0] if dates else ""
+
         nav = float(matched.get("nav") or 0)
         shares = market_value / nav if market_value > 0 and nav > 0 else 0.0
         cost = (market_value - holding_profit) / shares if shares > 0 else 0.0
@@ -213,6 +227,11 @@ def parse_named_holdings(items: list[dict], fund_map: dict) -> list[dict]:
             fund["shares"] = round(shares, 2)
         if cost > 0:
             fund["cost"] = round(cost, 4)
+        if shares > 0 and nav > 0:
+            # 截图日收盘净值和前一日净值，供前端先展示与原截图一致的收益。
+            fund["snapshot_current_price"] = round(nav, 4)
+            fund["snapshot_base_price"] = round(nav - day_profit / shares, 4)
+            fund["snapshot_date"] = snapshot_date
         funds.append(fund)
 
     return funds

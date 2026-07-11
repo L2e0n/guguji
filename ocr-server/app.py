@@ -226,7 +226,8 @@ def parse_named_holdings(items: list[dict], fund_map: dict) -> list[dict]:
         if shares > 0:
             fund["shares"] = round(shares, 2)
         if cost > 0:
-            fund["cost"] = round(cost, 4)
+            # 保留内部精度；四位小数仅用于界面展示，避免累计收益被放大舍入误差。
+            fund["cost"] = round(cost, 8)
         if shares > 0 and nav > 0:
             # 截图日收盘净值和前一日净值，供前端先展示与原截图一致的收益。
             fund["snapshot_current_price"] = round(nav, 4)

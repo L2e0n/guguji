@@ -9,7 +9,17 @@ v5.5.1
 - 🎨 **涨跌颜色**：红色涨↑ 绿色跌↓ 灰色持平
 - 📋 **Excel导入**：批量导入持仓
 - 💾 **本地存储**：数据全在浏览器 localStorage
-- 📷 **OCR识别**：截图自动识别持仓（需运行 OCR 后端）——因没有服务器资源，待定
+- 📷 **OCR识别**：截图自动识别持仓，支持导入前手工确认（需配置 `api.guguji.icu/ocr` 后端）
+
+## 部署说明
+- 前端静态页：`index.html`
+- 行情 / OCR 代理：`../guguji-proxy/worker.js`
+- 本地 OCR 原型：`ocr-server/app.py`
+
+### OCR 接入
+- Worker 通过环境变量 `OCR_API_BASE` 转发 `POST /ocr` 到 `${OCR_API_BASE}/api/ocr`
+- 健康检查走 `${OCR_API_BASE}/health`
+- 未配置 `OCR_API_BASE` 时，前端会自动显示 `OCR 未配置，先保留 Excel 导入`
 
 
 ## 联系

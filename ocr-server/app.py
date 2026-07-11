@@ -40,7 +40,7 @@ def get_ocr():
         from paddleocr import PaddleOCR
         try:
             _ocr = PaddleOCR(use_angle_cls=True, lang="ch", show_log=False)
-        except TypeError:
+        except (TypeError, ValueError):
             # Newer PaddleOCR builds removed some legacy kwargs such as show_log.
             _ocr = PaddleOCR(use_angle_cls=True, lang="ch")
         log.info("PaddleOCR 模型加载完成")

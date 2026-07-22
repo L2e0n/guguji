@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>咕咕鸡大作战 v5.5.0 </title>
+  <title>咕咕鸡大作战 v5.5.2 </title>
   <script src="https://lib.baomitu.com/vue/2.6.14/vue.min.js"></script>
   <script src="https://lib.baomitu.com/xlsx/0.17.0/xlsx.full.min.js"></script>
   <style>
@@ -77,7 +77,7 @@
 <div id="app" class="app-container" v-cloak>
   <div class="header">
     <a class="home-link" href="https://guguji.icu">← 返回主页</a>
-    <h1>🐤 <span>咕咕鸡</span>大作战 <small style="font-size:11px;color:#ccc;">v5.5.1</small></h1>
+    <h1>🐤 <span>咕咕鸡</span>大作战 <small style="font-size:11px;color:#ccc;">v5.5.2</small></h1>
     <p style="font-size:11px;color:#999;"> 咕咕咕</p>
   </div>
 
@@ -242,7 +242,7 @@
     </div>
   </div>
 
-  <div class="footer">&copy; 2026-2028 咕咕鸡大作战 v5.5.1 | 数据源: 天天基金/东方财富/新浪</div>
+  <div class="footer">&copy; 2026-2028 咕咕鸡大作战 v5.5.2 | 数据源: 天天基金/东方财富/新浪</div>
 </div>
 
 <script>
@@ -431,7 +431,7 @@ new Vue({
       const gzNum = parseFloat(gz);
       const gzStr = (Math.abs(gzNum) < 0.001) ? '0.00' : gz;
 
-      this.$set(this.fundData, code, { ...info, gszzl: gzStr });
+      this.$set(this.fundData, code, { ...exist, ...info, gszzl: gzStr });
       this.persistFundCache();
     },
 
@@ -441,18 +441,20 @@ new Vue({
         .then(res => {
           const m = res.match(/"(.*)"/);
           if (!m || !m[1]) return;
+          // 新浪基金 f_code: 名称,单位净值,累计净值,昨日净值,净值日期,...（非股票字段）
           const d = m[1].split(',');
           if (!d || d.length < 5) return;
-          const cp = parseFloat(d[3]);
-          const bp = parseFloat(d[2]);
+          const cp = parseFloat(d[1]); // 今日单位净值
+          const bp = parseFloat(d[3]); // 昨日单位净值
           if (!Number.isFinite(cp) || !Number.isFinite(bp) || bp === 0) return;
           const pct = ((cp - bp) / bp * 100).toFixed(2);
+          const navDate = (d[4] || '').trim();
           this.updateData(code, {
             name: d[0] || '',
             basePrice: bp.toFixed(4),
-            baseDate: '昨收价',
+            baseDate: '昨净值',
             currentPrice: cp.toFixed(4),
-            currentTime: '净值',
+            currentTime: navDate ? navDate.substring(5) : '净值',
             gszzl: pct,
             source: '官方'
           });

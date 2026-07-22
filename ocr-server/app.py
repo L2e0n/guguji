@@ -571,6 +571,121 @@ def fund_lookup():
     return jsonify({"code": code, "name": name or ""})
 
 
+
+def _normalize_fundgz_payload(payload):
+    """Normalize East Money / Tiantian fundgz payloads to a flat dict."""
+    if not isinstance(payload, dict):
+        return None
+    data = payload.get("Data")
+    if isinstance(data, list) and data:
+        data = data[0]
+    elif isinstance(data, dict):
+        pass
+    else:
+        data = payload
+    if not isinstance(data, dict):
+        return None
+    fundcode = data.get("fundcode") or data.get("fundCode") or data.get("code")
+    if not fundcode:
+        return None
+    gsz = data.get("gsz") if data.get("gsz") is not None else data.get("GSZ")
+    try:
+        gsz_num = float(gsz)
+    except (TypeError, ValueError):
+        return None
+    if gsz_num <= 0:
+        return None
+    return {
+        "fundcode": str(fundcode),
+        "name": data.get("name") or data.get("fundName") or "",
+        "dwjz": data.get("dwjz") if data.get("dwjz") is not None else data.get("DWJZ"),
+        "gsz": gsz,
+        "gszzl": data.get("gszzl") if data.get("gszzl") is not None else data.get("GSZZL"),
+        "jzrq": data.get("jzrq") or data.get("JZRQ") or data.get("navDate") or "",
+        "gztime": data.get("gztime") or data.get("GZTIME") or data.get("time") or "",
+    }
+
+
+def fetch_eastmoney_fundgz(code: str):
+    """Primary valuation source: East Money fundgz (requires eastmoney Referer)."""
+    url = f"https://api.fund.eastmoney.com/fund/fundgz?fundCode={code}&_={int(time.time() * 1000)}"
+    resp = requests.get(
+        url,
+        timeout=6,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Referer": "https://fund.eastmoney.com/",
+            "Accept": "*/*",
+        },
+    )
+    resp.raise_for_status()
+    text = resp.text.strip()
+    # tolerate optional JSONP wrapper
+    m = re.match(r"^[a-zA-Z_][\w.]*\((.*)\)\s*;?\s*$", text, re.S)
+    if m:
+        text = m.group(1)
+    payload = json.loads(text)
+    data = _normalize_fundgz_payload(payload)
+    if not data:
+        raise ValueError(f"eastmoney empty fundgz for {code}: {payload}")
+    data["channel"] = "东财"
+    return data
+
+
+def fetch_tiantian_fundgz(code: str):
+    """Fallback valuation source: legacy fundgz.1234567.com.cn JSONP."""
+    url = f"https://fundgz.1234567.com.cn/js/{code}.js?rt={int(time.time() * 1000)}"
+    resp = requests.get(
+        url,
+        timeout=6,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Referer": "https://fund.eastmoney.com/",
+            "Accept": "*/*",
+        },
+    )
+    resp.raise_for_status()
+    text = resp.text.strip()
+    if "<html" in text.lower():
+        raise ValueError("tiantian returned html 404")
+    m = re.search(r"jsonpgz\((.*)\)\s*;?\s*$", text, re.S)
+    if not m:
+        # sometimes bare object
+        payload = json.loads(text)
+    else:
+        payload = json.loads(m.group(1))
+    data = _normalize_fundgz_payload(payload)
+    if not data:
+        raise ValueError(f"tiantian empty fundgz for {code}")
+    data["channel"] = "天天"
+    return data
+
+
+@app.route("/api/fundgz/<code>", methods=["GET"])
+@app.route("/api/fundgz", methods=["GET"])
+def fund_gz(code=None):
+    """Public dual-source fund valuation proxy for ji.guguji.icu.
+
+    Primary: East Money fundgz (with proper Referer)
+    Fallback: Tiantian fundgz JSONP
+    No worker token required (market data only).
+    """
+    code = (code or request.args.get("code") or "").strip()
+    if not re.fullmatch(r"\d{6}", code):
+        return jsonify({"ok": False, "error": "invalid_code"}), 400
+
+    errors = []
+    for fetcher in (fetch_eastmoney_fundgz, fetch_tiantian_fundgz):
+        try:
+            data = fetcher(code)
+            return jsonify({"ok": True, **data})
+        except Exception as e:
+            errors.append(f"{fetcher.__name__}: {e}")
+            log.warning("fundgz fallback: %s", e)
+
+    return jsonify({"ok": False, "error": "no_valuation", "detail": errors}), 502
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     log.info(f"启动 OCR 服务, 端口: {port}")

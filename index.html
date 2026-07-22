@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>咕咕鸡大作战 v5.5.2 </title>
+  <title>咕咕鸡大作战 v5.5.3 </title>
   <script src="https://lib.baomitu.com/vue/2.6.14/vue.min.js"></script>
   <script src="https://lib.baomitu.com/xlsx/0.17.0/xlsx.full.min.js"></script>
   <style>
@@ -77,7 +77,7 @@
 <div id="app" class="app-container" v-cloak>
   <div class="header">
     <a class="home-link" href="https://guguji.icu">← 返回主页</a>
-    <h1>🐤 <span>咕咕鸡</span>大作战 <small style="font-size:11px;color:#ccc;">v5.5.2</small></h1>
+    <h1>🐤 <span>咕咕鸡</span>大作战 <small style="font-size:11px;color:#ccc;">v5.5.3</small></h1>
     <p style="font-size:11px;color:#999;"> 咕咕咕</p>
   </div>
 
@@ -242,7 +242,7 @@
     </div>
   </div>
 
-  <div class="footer">&copy; 2026-2028 咕咕鸡大作战 v5.5.2 | 数据源: 天天基金/东方财富/新浪</div>
+  <div class="footer">&copy; 2026-2028 咕咕鸡大作战 v5.5.3 | 数据源: 东财估值/东方财富/新浪</div>
 </div>
 
 <script>
@@ -340,39 +340,56 @@ new Vue({
       this.fetchPingZhongName(code);
     },
 
+    // 兼容旧 jsonpgz 回调；主路径已切到东财 fund/fundgz
     initTiantianJsonp() {
-      window.jsonpgz = (data) => {
-        if (!data || !data.fundcode) return;
-        const code = data.fundcode;
+      window.jsonpgz = (payload) => this.applyTiantianGz(payload);
+    },
 
-        const exist = this.fundData[code] || {};
-        const quoteDate = (data.gztime || '').substring(5, 10);
-        if (exist.source === '截图' && exist.snapshotDate && (!quoteDate || quoteDate <= exist.snapshotDate)) return;
-        if (exist.currentTime === '今日已出' || exist.source === '行情') return;
+    applyTiantianGz(payload) {
+      const data = (payload && payload.Data && payload.Data[0]) ? payload.Data[0] : payload;
+      if (!data || !data.fundcode) return;
+      const code = data.fundcode;
 
-        const dwjz = Number(data.dwjz);
-        const gsz = Number(data.gsz);
+      const exist = this.fundData[code] || {};
+      const quoteDate = (data.gztime || '').substring(5, 10);
+      if (exist.source === '截图' && exist.snapshotDate && (!quoteDate || quoteDate <= exist.snapshotDate)) return;
+      if (exist.currentTime === '今日已出' || exist.source === '行情') return;
 
-        this.$set(this.fundData, code, {
-          ...exist,
-          name: data.name || exist.name,
-          basePrice: Number.isFinite(dwjz) ? dwjz.toFixed(4) : (exist.basePrice || ''),
-          baseDate: (data.jzrq || '').substring(5) || (exist.baseDate || '--'),
-          currentPrice: Number.isFinite(gsz) ? gsz.toFixed(4) : (exist.currentPrice || ''),
-          currentTime: (data.gztime || '').substring(5) || '估值',
-          gszzl: data.gszzl,
-          source: '估值'
-        });
-        this.persistFundCache();
-      };
+      const dwjz = Number(data.dwjz);
+      const gsz = Number(data.gsz);
+      if (!Number.isFinite(gsz) || gsz <= 0) return; // 无估值时不覆盖官方净值
+
+      this.$set(this.fundData, code, {
+        ...exist,
+        name: data.name || exist.name,
+        basePrice: Number.isFinite(dwjz) ? dwjz.toFixed(4) : (exist.basePrice || ''),
+        baseDate: (data.jzrq || '').substring(5) || (exist.baseDate || '--'),
+        currentPrice: gsz.toFixed(4),
+        currentTime: (data.gztime || '').substring(5) || '估值',
+        gszzl: data.gszzl,
+        source: '估值'
+      });
+      this.persistFundCache();
     },
 
     fetchTiantian(code) {
+      // 东财实时估值 JSONP: /fund/fundgz
+      if (!this._ttSeq) this._ttSeq = 0;
+      const seq = ++this._ttSeq;
+      const cbName = 'ttGzCb' + seq;
+      const timeout = setTimeout(() => { try { delete window[cbName]; } catch (e) {} }, 8000);
+
+      window[cbName] = (payload) => {
+        clearTimeout(timeout);
+        try { delete window[cbName]; } catch (e) {}
+        this.applyTiantianGz(payload);
+      };
+
       const script = document.createElement('script');
-      script.src = `https://fundgz.1234567.com.cn/js/${code}.js?rt=${Date.now()}`;
+      script.src = `https://api.fund.eastmoney.com/fund/fundgz?fundCode=${code}&callback=${cbName}&_=${Date.now()}`;
       script.async = true;
       script.onload = () => script.remove();
-      script.onerror = () => script.remove();
+      script.onerror = () => { try { delete window[cbName]; } catch (e) {} script.remove(); };
       document.body.appendChild(script);
     },
 

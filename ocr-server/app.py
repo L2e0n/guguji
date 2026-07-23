@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 咕咕鸡大作战 - OCR持仓识别服务
 基于 PaddleOCR 的基金持仓截图识别
@@ -26,6 +26,8 @@ from flask_cors import CORS
 from PIL import Image
 import requests
 
+import qdii_service
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("guguji-ocr")
 
@@ -33,7 +35,15 @@ log = logging.getLogger("guguji-ocr")
 os.environ.setdefault("FLAGS_enable_pir_api", "0")
 
 app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": ["https://ji.guguji.icu"]}})
+CORS(app, resources={r"/api/*": {"origins": [
+    "https://ji.guguji.icu",
+    "https://qdii.guguji.icu",
+    "https://ocr.guguji.icu",
+    "http://localhost:5000",
+    "http://127.0.0.1:5000",
+    "http://localhost:5500",
+    "http://127.0.0.1:5500",
+]}})
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16MB
 app.config["UPLOAD_FOLDER"] = "/tmp/guguji_ocr"
 Image.MAX_IMAGE_PIXELS = 20_000_000
@@ -685,6 +695,64 @@ def fund_gz(code=None):
 
     return jsonify({"ok": False, "error": "no_valuation", "detail": errors}), 502
 
+
+
+# ── QDII 额度监控 API（供 qdii.guguji.icu）──────────────────────────
+@app.route("/api/qdii/health", methods=["GET"])
+def qdii_health():
+    try:
+        qdii_service.init_db()
+        return jsonify({"ok": True, "service": "qdii", "source": "eastmoney"})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/qdii/batch", methods=["GET", "POST"])
+def qdii_batch():
+    """Batch purchase-limit snapshots. GET ?codes=016664,539002 or POST JSON {codes:[]}."""
+    codes = []
+    if request.method == "POST":
+        body = request.get_json(silent=True) or {}
+        codes = body.get("codes") or []
+    if not codes:
+        raw = request.args.get("codes") or request.args.get("code") or ""
+        codes = re.split(r"[\s,;|]+", raw)
+    codes = [c.strip() for c in codes if c and c.strip()]
+    if not codes:
+        return jsonify({"ok": False, "error": "codes_required"}), 400
+    if len(codes) > qdii_service.BATCH_MAX:
+        return jsonify({"ok": False, "error": f"too_many_codes_max_{qdii_service.BATCH_MAX}"}), 400
+    refresh = request.args.get("refresh", "").lower() in ("1", "true", "yes")
+    items = qdii_service.fetch_qdii_batch(codes, use_cache=not refresh)
+    return jsonify({"ok": True, "count": len(items), "items": items})
+
+
+@app.route("/api/qdii/<code>", methods=["GET"])
+def qdii_one(code):
+    """Single fund purchase-limit snapshot (East Money SGZT/MAXSG)."""
+    code = (code or "").strip()
+    if not re.fullmatch(r"\d{6}", code):
+        return jsonify({"ok": False, "error": "invalid_code"}), 400
+    refresh = request.args.get("refresh", "").lower() in ("1", "true", "yes")
+    try:
+        data = qdii_service.fetch_qdii(code, use_cache=not refresh)
+        return jsonify({"ok": True, **data})
+    except Exception as e:
+        log.warning("qdii one failed %s: %s", code, e)
+        return jsonify({"ok": False, "code": code, "error": str(e)}), 502
+
+
+@app.route("/api/qdii/<code>/history", methods=["GET"])
+def qdii_history(code):
+    code = (code or "").strip()
+    if not re.fullmatch(r"\d{6}", code):
+        return jsonify({"ok": False, "error": "invalid_code"}), 400
+    try:
+        limit = int(request.args.get("limit", qdii_service.HISTORY_LIMIT_DEFAULT))
+    except ValueError:
+        limit = qdii_service.HISTORY_LIMIT_DEFAULT
+    rows = qdii_service.get_history(code, limit=limit)
+    return jsonify({"ok": True, "code": code, "count": len(rows), "items": rows})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))

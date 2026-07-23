@@ -1,4 +1,4 @@
-﻿"""QDII purchase-limit monitoring service (East Money primary source)."""
+"""QDII purchase-limit monitoring service (East Money primary source)."""
 
 from __future__ import annotations
 
@@ -30,12 +30,14 @@ EM_HEADERS = {
 # Treat as "no practical cap" when MAXSG is huge.
 OPEN_MAXSG_THRESHOLD = 1e9
 CACHE_TTL_SECONDS = 60
+HOLDINGS_CACHE_TTL_SECONDS = 6 * 3600  # quarterly data; refresh a few times/day
 BATCH_MAX = 50
 HISTORY_LIMIT_DEFAULT = 50
 
 _db_lock = threading.Lock()
 _mem_cache: dict[str, tuple[float, dict]] = {}
 _mem_lock = threading.Lock()
+_holdings_cache: dict[str, tuple[float, dict]] = {}
 
 
 def _now_iso() -> str:
@@ -409,6 +411,83 @@ def get_history(code: str, limit: int = HISTORY_LIMIT_DEFAULT) -> list[dict]:
             conn.close()
 
 
+
+def fetch_eastmoney_holdings(code: str) -> dict:
+    """Top stock holdings from East Money FundMNInverstPosition (prefer top 10)."""
+    code = str(code).strip().zfill(6)
+    url = (
+        "https://fundmobapi.eastmoney.com/FundMNewApi/FundMNInverstPosition"
+        f"?FCODE={code}&deviceid=Wap&plat=Wap&product=EFund&version=2.0.0"
+    )
+    resp = requests.get(url, headers=EM_HEADERS, timeout=8)
+    resp.raise_for_status()
+    payload = resp.json()
+    datas = payload.get("Datas") or {}
+    if not isinstance(datas, dict):
+        datas = {}
+    stocks = datas.get("fundStocks") or []
+    if not isinstance(stocks, list):
+        stocks = []
+
+    items: list[dict] = []
+    for s in stocks:
+        if not isinstance(s, dict):
+            continue
+        name = (s.get("GPJC") or s.get("GPDM") or "").strip()
+        if not name:
+            continue
+        pct = _to_float(s.get("JZBL"))
+        items.append(
+            {
+                "name": name,
+                "pct": pct,
+                "code": str(s.get("GPDM") or "").strip(),
+            }
+        )
+
+    # Prefer top 10; if API returns fewer, show what we have (e.g. top 5).
+    items = items[:10]
+
+    as_of = payload.get("Expansion") or datas.get("FSRQ") or ""
+    return {
+        "as_of": str(as_of) if as_of is not None else "",
+        "count": len(items),
+        "items": items,
+        "source": "eastmoney",
+    }
+
+
+def get_holdings(code: str, use_cache: bool = True) -> dict:
+    code = str(code).strip().zfill(6)
+    if use_cache:
+        with _mem_lock:
+            hit = _holdings_cache.get(code)
+            if hit:
+                ts, data = hit
+                if time.time() - ts <= HOLDINGS_CACHE_TTL_SECONDS:
+                    return dict(data)
+
+    try:
+        data = fetch_eastmoney_holdings(code)
+    except Exception as e:
+        log.warning("holdings fetch failed %s: %s", code, e)
+        data = {"as_of": "", "count": 0, "items": [], "source": "eastmoney", "error": str(e)}
+
+    with _mem_lock:
+        _holdings_cache[code] = (time.time(), dict(data))
+    return dict(data)
+
+
+def attach_holdings(record: dict, use_cache: bool = True) -> dict:
+    out = dict(record)
+    code = out.get("code") or ""
+    if code:
+        out["holdings"] = get_holdings(code, use_cache=use_cache)
+    else:
+        out["holdings"] = {"as_of": "", "count": 0, "items": []}
+    return out
+
+
 def fetch_qdii(code: str, use_cache: bool = True) -> dict:
     code = str(code).strip().zfill(6)
     if not re.fullmatch(r"\d{6}", code):
@@ -417,14 +496,16 @@ def fetch_qdii(code: str, use_cache: bool = True) -> dict:
     if use_cache:
         cached = get_cached(code)
         if cached:
+            cached = attach_holdings(cached, use_cache=True)
             cached["cached"] = True
             return cached
 
     raw = fetch_eastmoney_basic(code)
     record = normalize_record(raw, source="eastmoney")
     record = save_snapshot(record)
+    record = attach_holdings(record, use_cache=use_cache)
     record["cached"] = False
-    set_cached(code, record)
+    set_cached(code, dict(record))
     return record
 
 

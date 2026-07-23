@@ -1,4 +1,4 @@
-# guguji
+﻿# guguji
 咕咕鸡大作战-基金估值工具 
 
 非程序员，vibe coding 纯手搓玩具
@@ -26,3 +26,9 @@ v5.5.4
 
 ## 联系
 leon.zhh@foxmail.com
+
+## QDII 额度监控
+- 前端：`https://ocr.guguji.icu/qdii/`（目标域名 `qdii.guguji.icu`，待 DNS CNAME）
+- API：`GET /api/qdii/{code}` / `GET /api/qdii/batch?codes=...` / `GET /api/qdii/{code}/history`
+- 数据口径：东财申购状态 + 单日累计申购上限（服务端 `qdii_service.py`）
+

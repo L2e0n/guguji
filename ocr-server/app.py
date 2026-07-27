@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 咕咕鸡大作战 - OCR持仓识别服务
 基于 PaddleOCR 的基金持仓截图识别
@@ -27,6 +27,7 @@ from PIL import Image
 import requests
 
 import qdii_service
+import qdii_radar
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("guguji-ocr")
@@ -693,7 +694,7 @@ def fund_gz(code=None):
             errors.append(f"{fetcher.__name__}: {e}")
             log.warning("fundgz fallback: %s", e)
 
-    return jsonify({"ok": False, "error": "no_valuation", "detail": errors}), 502
+    return jsonify({"ok": False, "error": "no_valuation", "detail": errors, "hint": "QDII often has no real-time valuation"}), 200
 
 
 
@@ -753,6 +754,104 @@ def qdii_history(code):
         limit = qdii_service.HISTORY_LIMIT_DEFAULT
     rows = qdii_service.get_history(code, limit=limit)
     return jsonify({"ok": True, "code": code, "count": len(rows), "items": rows})
+
+
+
+# ── QDII 雷达扫描 API（AI算力/半导体产业链）────────────────────────
+@app.route("/api/qdii/radar/status", methods=["GET"])
+def qdii_radar_status():
+    try:
+        qdii_radar.init_radar_db()
+        return jsonify(qdii_radar.get_status())
+    except Exception as e:
+        log.warning("qdii radar status failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/qdii/radar/pool", methods=["GET"])
+def qdii_radar_pool():
+    try:
+        limit = int(request.args.get("limit", 100))
+    except ValueError:
+        limit = 100
+    try:
+        items = qdii_radar.get_pool(limit=limit)
+        return jsonify({"ok": True, "count": len(items), "items": items})
+    except Exception as e:
+        log.warning("qdii radar pool failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/qdii/radar/events", methods=["GET"])
+def qdii_radar_events():
+    try:
+        days = int(request.args.get("days", 7))
+    except ValueError:
+        days = 7
+    try:
+        limit = int(request.args.get("limit", 100))
+    except ValueError:
+        limit = 100
+    event_type = (request.args.get("type") or "").strip() or None
+    try:
+        items = qdii_radar.get_events(days=days, limit=limit, event_type=event_type)
+        return jsonify({"ok": True, "count": len(items), "items": items})
+    except Exception as e:
+        log.warning("qdii radar events failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/qdii/radar/scores", methods=["GET"])
+def qdii_radar_scores():
+    try:
+        limit = int(request.args.get("limit", 100))
+    except ValueError:
+        limit = 100
+    try:
+        min_score = float(request.args.get("min_score", 0))
+    except ValueError:
+        min_score = 0
+    try:
+        items = qdii_radar.get_scores(limit=limit, min_score=min_score)
+        return jsonify({"ok": True, "count": len(items), "items": items})
+    except Exception as e:
+        log.warning("qdii radar scores failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/qdii/radar/run", methods=["POST", "GET"])
+def qdii_radar_run():
+    """Manual trigger. Optional token: env QDII_RADAR_TOKEN / header X-Radar-Token / ?token=."""
+    import os
+
+    expected = (os.environ.get("QDII_RADAR_TOKEN") or "").strip()
+    if expected:
+        got = (
+            (request.headers.get("X-Radar-Token") or "").strip()
+            or (request.args.get("token") or "").strip()
+        )
+        if got != expected:
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    mode = (request.args.get("mode") or "full").strip().lower()
+    refresh = request.args.get("refresh", "").lower() in ("1", "true", "yes")
+    use_cache = request.args.get("use_cache", "").lower() in ("1", "true", "yes")
+    try:
+        if mode in ("universe", "score", "u1"):
+            result = qdii_radar.run_universe_and_score(refresh_holdings=refresh)
+        elif mode in ("quota", "limit"):
+            result = qdii_radar.run_quota_scan(use_cache=use_cache)
+        else:
+            result = qdii_radar.run_full_scan(
+                refresh_holdings=refresh,
+                use_quota_cache=use_cache,
+            )
+        code = 200 if result.get("ok") else 500
+        return jsonify(result), code
+    except Exception as e:
+        log.exception("qdii radar run failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))

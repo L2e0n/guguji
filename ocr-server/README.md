@@ -1,37 +1,74 @@
-# OCR Server
+# guguji OCR / QDII 服务
 
-本目录是 `guguji` 的 OCR 后端原型，供 `api.guguji.icu/ocr` 反代调用。
-
-## 本地运行
+## 本地启动
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
 pip install -r requirements.txt
 python app.py
 ```
 
-服务端代码已经兼容较新的 PaddleOCR 3.x，并在 CPU 环境下默认关闭 `mkldnn`、禁用 PIR API，避免部分主机上的推理异常。
+## QDII 额度 API
 
-## Docker 运行
+- `GET /api/qdii/health`
+- `GET /api/qdii/batch?codes=016664,539002`
+- `GET /api/qdii/<code>`
+- `GET /api/qdii/<code>/history`
+
+## QDII 雷达扫描（AI 算力 / 半导体产业链）
+
+后台扫描模块（**暂无推送**）：
+
+| 文件 | 说明 |
+|---|---|
+| `qdii_radar.py` | 候选池、相似度、精池、限额事件 |
+| `qdii_radar_config.json` | 可覆盖默认 seed / 阈值等 |
+| `scan_qdii_radar.py` | 定时任务 CLI |
+
+### 监控标的
+
+- **硬件核心 weight=1.0**：台积电、阿斯麦、AMD、英特尔、ARM、三星、美光、SK海力士、英伟达、Marvell、Tower、GlobalFoundries、Lumentum、Coherent
+- **CSP weight=0.85（略低）**：谷歌、微软、Meta、苹果、亚马逊（不加特斯拉）
+
+### CLI
 
 ```bash
-docker build -t guguji-ocr .
-docker run -d --name guguji-ocr -p 5000:5000 --restart unless-stopped guguji-ocr
+# 全量：主题池打分 + 精池限额扫描
+python scan_qdii_radar.py full
+
+# 仅日更候选池/打分
+python scan_qdii_radar.py universe
+
+# 仅精池限额
+python scan_qdii_radar.py quota
+
+python scan_qdii_radar.py status
+python scan_qdii_radar.py pool
+python scan_qdii_radar.py events
 ```
 
-## Cloudflare Worker 对接
-
-Worker 需要配置：
-
-```bash
-npx wrangler secret put OCR_API_BASE
-```
-
-值填 OCR 服务的公网基址，例如：
+建议 cron（Asia/Shanghai）：
 
 ```text
-http://<your-server-ip>:5000
+# 交易时段每 15 分钟扫限额
+*/15 9-15 * * 1-5 cd /app && python scan_qdii_radar.py quota
+
+# 每天 08:30 / 18:30 刷新主题池与持仓相似度
+30 8,18 * * 1-5 cd /app && python scan_qdii_radar.py universe
 ```
 
-然后重新部署 `guguji-proxy`。
+### Radar API
+
+- `GET /api/qdii/radar/status`
+- `GET /api/qdii/radar/pool`
+- `GET /api/qdii/radar/events?days=7`
+- `GET /api/qdii/radar/scores`
+- `POST /api/qdii/radar/run?mode=full|universe|quota`  
+  - 若设置环境变量 `QDII_RADAR_TOKEN`，需带 `X-Radar-Token` 或 `?token=`
+
+事件类型：
+
+- `E1_quota_loosen` 放额
+- `E2_new_pool` 上新入池（冷启动不写）
+- `E3_quota_tighten` 从紧
+
+数据表与额度快照共用 `data/qdii.db`（可用 `QDII_DB_PATH` 覆盖）。

@@ -72,3 +72,16 @@ python scan_qdii_radar.py events
 - `E3_quota_tighten` 从紧
 
 数据表与额度快照共用 `data/qdii.db`（可用 `QDII_DB_PATH` 覆盖）。
+
+## A股板块实时资金流向
+
+模块：`sector_flow.py`（东财板块资金流）
+
+### API
+
+- `GET /api/sector/health`
+- `GET /api/sector/flow?type=industry|concept|region&period=1|5|10&sort=in|out|change&limit=50&primary_only=1`
+- `GET /api/sector/dual?type=industry&period=1&top=20`
+- `GET /api/sector/<code>/members?limit=30&sort=in`
+
+前端仓库：`guguji-sector`（目标域名 `sector.guguji.icu`）。

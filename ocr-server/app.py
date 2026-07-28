@@ -28,6 +28,7 @@ import requests
 
 import qdii_service
 import qdii_radar
+import sector_flow
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("guguji-ocr")
@@ -39,11 +40,14 @@ app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": [
     "https://ji.guguji.icu",
     "https://qdii.guguji.icu",
+    "https://gu.guguji.icu",
     "https://ocr.guguji.icu",
     "http://localhost:5000",
     "http://127.0.0.1:5000",
     "http://localhost:5500",
     "http://127.0.0.1:5500",
+    "http://localhost:8088",
+    "http://127.0.0.1:8088",
 ]}})
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16MB
 app.config["UPLOAD_FOLDER"] = "/tmp/guguji_ocr"
@@ -850,6 +854,106 @@ def qdii_radar_run():
         return jsonify(result), code
     except Exception as e:
         log.exception("qdii radar run failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+
+# ── A股板块实时资金流向 API ─────────────────────────────────────
+@app.route("/api/sector/health", methods=["GET"])
+def sector_health():
+    try:
+        return jsonify(sector_flow.health())
+    except Exception as e:
+        log.warning("sector health failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/sector/flow", methods=["GET"])
+def sector_flow_list():
+    """Ranked board fund-flow.
+    Query: type=industry|concept|region, period=1|5|10, sort=in|out|change,
+           limit, page, primary_only=1, refresh=0
+    """
+    board_type = (request.args.get("type") or "industry").strip()
+    period = (request.args.get("period") or "1").strip()
+    sort = (request.args.get("sort") or "in").strip()
+    try:
+        limit = int(request.args.get("limit", 50))
+    except ValueError:
+        limit = 50
+    try:
+        page = int(request.args.get("page", 1))
+    except ValueError:
+        page = 1
+    primary_only = request.args.get("primary_only", "1").lower() not in ("0", "false", "no")
+    refresh = request.args.get("refresh", "").lower() in ("1", "true", "yes")
+    try:
+        result = sector_flow.fetch_board_flow(
+            board_type=board_type,
+            period=period,
+            sort=sort,
+            limit=limit,
+            page=page,
+            primary_only=primary_only,
+            refresh=refresh,
+        )
+        return jsonify(result)
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        log.warning("sector flow failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/sector/dual", methods=["GET"])
+def sector_dual():
+    """Top inflow + top outflow snapshot."""
+    board_type = (request.args.get("type") or "industry").strip()
+    period = (request.args.get("period") or "1").strip()
+    try:
+        top = int(request.args.get("top", 20))
+    except ValueError:
+        top = 20
+    primary_only = request.args.get("primary_only", "1").lower() not in ("0", "false", "no")
+    refresh = request.args.get("refresh", "").lower() in ("1", "true", "yes")
+    try:
+        return jsonify(
+            sector_flow.dual_rank(
+                board_type=board_type,
+                period=period,
+                top=top,
+                primary_only=primary_only,
+                refresh=refresh,
+            )
+        )
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        log.warning("sector dual failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/sector/<code>/members", methods=["GET"])
+def sector_members(code):
+    try:
+        limit = int(request.args.get("limit", 30))
+    except ValueError:
+        limit = 30
+    sort = (request.args.get("sort") or "in").strip()
+    refresh = request.args.get("refresh", "").lower() in ("1", "true", "yes")
+    try:
+        return jsonify(
+            sector_flow.fetch_board_members(
+                board_code=code,
+                limit=limit,
+                sort=sort,
+                refresh=refresh,
+            )
+        )
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        log.warning("sector members failed: %s", e)
         return jsonify({"ok": False, "error": str(e)}), 500
 
 

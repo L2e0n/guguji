@@ -1125,14 +1125,33 @@ def _blend_curves(*curves: dict[int, float]) -> dict[int, float]:
     return out
 
 
-def _get_volume_profiles(today: str) -> tuple[dict[int, float], dict[int, float], dict[int, float]]:
-    """Cached SH/SZ/HS cumulative-volume-ratio curves (exclude today)."""
+def _complete_day_totals(
+    by_day: dict[str, list[tuple[str, float]]], exclude_day: str
+) -> list[tuple[str, float]]:
+    """Return [(day, total_yuan), ...] for complete hist days, newest first."""
+    rows: list[tuple[str, float]] = []
+    for day, pts in by_day.items():
+        if day == exclude_day:
+            continue
+        if len(pts) < 200:
+            continue
+        total = sum(a for _, a in pts)
+        if total > 0:
+            rows.append((day, float(total)))
+    rows.sort(key=lambda x: x[0], reverse=True)
+    return rows
+
+
+def _get_volume_profiles(today: str) -> dict[str, Any]:
+    """Cached SH/SZ/HS ratio curves + previous complete-day totals."""
     cache_key = f"vol_profile:{today}"
     cached = _cache_get(cache_key)
     if cached is not None:
-        return cached["sh"], cached["sz"], cached["hs"]
+        return cached
     sh_curve: dict[int, float] = {}
     sz_curve: dict[int, float] = {}
+    sh_by: dict[str, list[tuple[str, float]]] = {}
+    sz_by: dict[str, list[tuple[str, float]]] = {}
     try:
         sh_by = _parse_trends_amounts(_fetch_index_trends("1.000001", ndays=5))
         sz_by = _parse_trends_amounts(_fetch_index_trends("0.399001", ndays=5))
@@ -1141,10 +1160,32 @@ def _get_volume_profiles(today: str) -> tuple[dict[int, float], dict[int, float]
     except Exception as e:
         log.warning("volume profile build failed: %s", e)
     hs_curve = _blend_curves(sh_curve, sz_curve)
-    payload = {"sh": sh_curve, "sz": sz_curve, "hs": hs_curve}
+
+    sh_days = _complete_day_totals(sh_by, exclude_day=today)
+    sz_days = _complete_day_totals(sz_by, exclude_day=today)
+    # align previous trading day: prefer intersection of days present on both
+    sh_map = {d: a for d, a in sh_days}
+    sz_map = {d: a for d, a in sz_days}
+    common = sorted(set(sh_map) & set(sz_map), reverse=True)
+    prev_day = common[0] if common else (sh_days[0][0] if sh_days else (sz_days[0][0] if sz_days else None))
+    prev_sh = sh_map.get(prev_day) if prev_day else None
+    prev_sz = sz_map.get(prev_day) if prev_day else None
+    prev_hs = None
+    if prev_sh is not None or prev_sz is not None:
+        prev_hs = float(prev_sh or 0.0) + float(prev_sz or 0.0)
+
+    payload: dict[str, Any] = {
+        "sh": sh_curve,
+        "sz": sz_curve,
+        "hs": hs_curve,
+        "prev_day": prev_day,
+        "prev_sh": prev_sh,
+        "prev_sz": prev_sz,
+        "prev_hs": prev_hs,
+    }
     # historical profiles are stable intraday
     _cache_set(cache_key, payload, ttl=1800.0)
-    return sh_curve, sz_curve, hs_curve
+    return payload
 
 
 def _fetch_index_quotes() -> list[dict[str, Any]]:
@@ -1333,7 +1374,12 @@ def market_overview(refresh: bool = False) -> dict[str, Any]:
     by_code = {str(x.get("f12")): x for x in quotes}
     now_hhmm = (progress.get("asof_time") or "09:30")[:5]
     today = progress.get("day") or _now().strftime("%Y-%m-%d")
-    sh_curve, sz_curve, hs_curve = _get_volume_profiles(today)
+    prof = _get_volume_profiles(today)
+    sh_curve = prof.get("sh") or {}
+    sz_curve = prof.get("sz") or {}
+    hs_curve = prof.get("hs") or {}
+    prev_day = prof.get("prev_day")
+    prev_hs = prof.get("prev_hs")
 
     def _idx(code: str, name_fallback: str, curve: Optional[dict[int, float]] = None) -> dict[str, Any]:
         row = by_code.get(code) or {}
@@ -1386,6 +1432,55 @@ def market_overview(refresh: bool = False) -> dict[str, Any]:
     total_amt = hs_amt + bj_a
     hs_pred, hs_method, hs_ratio = _predict_by_profile(hs_amt, now_hhmm, hs_curve, p)
     total_pred, total_method, total_ratio = _predict_by_profile(total_amt, now_hhmm, hs_curve, p)
+
+    # 较昨日放量/缩量：盘中用预测全天 vs 上一完整交易日沪深成交额；收盘后用实际
+    vs_prev: dict[str, Any] = {
+        "prev_day": prev_day,
+        "prev_hs_amount": prev_hs,
+        "prev_hs_amount_yi": _yi(prev_hs) if prev_hs is not None else None,
+        "basis": None,
+        "today_ref": None,
+        "today_ref_yi": None,
+        "delta": None,
+        "delta_yi": None,
+        "direction": None,  # expand / shrink / flat
+        "label": None,
+    }
+    if prev_hs is not None and prev_hs > 0:
+        if p >= 0.995:
+            today_ref = float(hs_amt)  # 收盘用沪深实际；京所体量很小
+            basis = "actual_hs"
+        elif hs_pred is not None:
+            today_ref = float(hs_pred)
+            basis = "predict_hs"
+        elif total_pred is not None:
+            today_ref = float(total_pred)
+            basis = "predict_total"
+        else:
+            today_ref = None
+            basis = None
+        if today_ref is not None:
+            delta = today_ref - float(prev_hs)
+            delta_yi = _yi(delta)
+            if delta_yi is None:
+                direction, label = None, None
+            elif abs(delta_yi) < 1:  # <1亿视为持平
+                direction, label = "flat", "持平"
+            elif delta_yi > 0:
+                direction, label = "expand", "放量"
+            else:
+                direction, label = "shrink", "缩量"
+            vs_prev.update(
+                {
+                    "basis": basis,
+                    "today_ref": today_ref,
+                    "today_ref_yi": _yi(today_ref),
+                    "delta": delta,
+                    "delta_yi": delta_yi,
+                    "direction": direction,
+                    "label": label,
+                }
+            )
 
     day_key = _now().strftime("%Y%m%d")
     zt_pool, dt_pool, zb_pool = [], [], []
@@ -1445,6 +1540,7 @@ def market_overview(refresh: bool = False) -> dict[str, Any]:
             "predict_confidence": _predict_confidence(p, method=total_method if total_method != "none" else "linear"),
             "profile_minutes": len(hs_curve),
             "asof_hhmm": now_hhmm,
+            "vs_prev": vs_prev,
         },
         "limit": {
             "date": day_key,

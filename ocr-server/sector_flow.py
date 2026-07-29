@@ -480,9 +480,22 @@ _INTRADAY_TTL = 12.0
 
 
 def _hhmm_from_any(s: str) -> str:
-    s = (s or "").strip()
+    """Normalize time to HH:MM. Accepts HH:MM, HH:MM:SS, YYYY-MM-DD HH:MM, compact 0931."""
+    s = (s or "").strip().replace("：", ":")
+    if not s:
+        return "09:30"
+    # date-time -> take clock part
     if " " in s:
         s = s.split(" ")[-1]
+    # HH:MM or HH:MM:SS
+    if ":" in s:
+        parts = s.split(":")
+        try:
+            h = int(parts[0])
+            m = int(parts[1]) if len(parts) > 1 else 0
+            return f"{h:02d}:{m:02d}"
+        except Exception:
+            pass
     if len(s) >= 5 and s[2] == ":":
         return s[:5]
     # compact 0931 / 202607290931
@@ -944,19 +957,6 @@ def _predict_confidence(progress: float, method: str = "linear") -> str:
     if progress >= 0.12:
         return "low"
     return "very_low"
-
-
-def _hhmm_from_any(tm: str) -> str:
-    s = (tm or "").strip()
-    if not s:
-        return "09:30"
-    parts = s.replace("：", ":").split(":")
-    try:
-        h = int(parts[0])
-        m = int(parts[1]) if len(parts) > 1 else 0
-        return f"{h:02d}:{m:02d}"
-    except Exception:
-        return s[:5] if len(s) >= 5 else "09:30"
 
 
 def _hhmm_to_session_idx(hhmm: str) -> Optional[int]:

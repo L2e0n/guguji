@@ -51,7 +51,8 @@ LIST_FIELDS = (
     "f66,f69,f72,f75,f78,f81,f84,f87,"
     "f104,f105,f106,"
     "f164,f166,f168,f170,f172,f174,f175,f176,f177,f178,f179,"
-    "f204,f205,f206,f124"
+    "f128,f136,f140,"
+    "f204,f205,f206,f207,f208,f222,f124"
 )
 
 MEMBER_FIELDS = (
@@ -198,9 +199,17 @@ def _normalize_board(row: dict, board_type: str, period: str) -> dict:
         "up_count": int(_num(row.get("f104")) or 0),
         "down_count": int(_num(row.get("f105")) or 0),
         "flat_count": int(_num(row.get("f106")) or 0),
-        "leader_name": row.get("f204") or "",
-        "leader_code": row.get("f205") or "",
-        "leader_change_pct": _num(row.get("f206")),
+        # 领涨: f204/f205 + f136(涨跌幅更可靠); 领跌: f207/f208 + f222
+        "leader_name": row.get("f204") or row.get("f128") or "",
+        "leader_code": row.get("f205") or row.get("f140") or "",
+        "leader_change_pct": (
+            _num(row.get("f136"))
+            if _num(row.get("f136")) is not None
+            else _num(row.get("f206"))
+        ),
+        "laggard_name": row.get("f207") or "",
+        "laggard_code": row.get("f208") or "",
+        "laggard_change_pct": _num(row.get("f222")),
         "signal": sig,
         "updated_ts": int(_num(row.get("f124")) or 0),
     }

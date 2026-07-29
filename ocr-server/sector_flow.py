@@ -461,7 +461,13 @@ def health() -> dict[str, Any]:
 
 
 # ── Intraday multi-board main-force path (Eastmoney fflow kline + local snaps) ──
+# push2 clist often accepts the first ut; fflow/kline needs the data.eastmoney ut.
 EM_UT = "b2884a393a59ad64002292a3e90d46a5"
+EM_FFLOW_UTS = [
+    "fa5fd1943c7b386f172d6893dbfba10b",  # data.eastmoney board money-flow
+    "b2884a393a59ad64002292a3e90d46a5",
+    "7eea3edcaed734bea9cbfc24409ed989",
+]
 EM_FFLOW_KLINE_HOSTS = [
     "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get",
     "https://push2delay.eastmoney.com/api/qt/stock/fflow/kline/get",
@@ -517,36 +523,62 @@ def _fetch_one_fflow_minute(code: str, klt: int = 1) -> dict[str, Any]:
         raise ValueError("bad board code")
     session = requests.Session()
     session.trust_env = False
-    params = {
-        "lmt": 0,
-        "klt": int(klt),
-        "fields1": "f1,f2,f3,f7",
-        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65",
-        "ut": EM_UT,
-        "secid": f"90.{code}",
-        "secid2": "",
-        "_": int(time.time() * 1000),
-    }
     last_err: Exception | None = None
-    for url in EM_FFLOW_KLINE_HOSTS:
-        try:
-            r = session.get(url, params=params, headers=EM_HEADERS, timeout=8)
-            r.raise_for_status()
-            data = r.json()
-            d = data.get("data") or {}
-            pts = _parse_fflow_klines(d.get("klines") or [])
-            return {
-                "ok": True,
-                "code": code,
-                "name": d.get("name") or "",
-                "points": pts,
-                "source": "eastmoney_fflow_kline",
+    hosts = list(EM_FFLOW_KLINE_HOSTS) + [
+        "https://82.push2.eastmoney.com/api/qt/stock/fflow/kline/get",
+    ]
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        ),
+        "Referer": f"https://data.eastmoney.com/bkzj/{code}.html",
+        "Accept": "*/*",
+    }
+    for ut in EM_FFLOW_UTS:
+        for url in hosts:
+            params = {
+                "lmt": 0,
+                "klt": int(klt),
+                "fields1": "f1,f2,f3,f7",
+                "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65",
+                "ut": ut,
+                "secid": f"90.{code}",
+                "_": int(time.time() * 1000),
             }
-        except Exception as e:
-            last_err = e
-            continue
+            try:
+                r = session.get(url, params=params, headers=headers, timeout=8)
+                r.raise_for_status()
+                data = r.json()
+                d = data.get("data") or {}
+                pts = _parse_fflow_klines(d.get("klines") or [])
+                if not pts:
+                    last_err = RuntimeError(f"empty_klines rc={data.get('rc')} ut={ut[:8]}")
+                    continue
+                # chart continuity: start at open zero if EM starts at 09:31
+                if pts and (pts[0].get("t") or "") > "09:30":
+                    pts = [
+                        {
+                            "t": "09:30",
+                            "main_net": 0.0,
+                            "main_net_yi": 0.0,
+                            "super_net_yi": 0.0,
+                            "large_net_yi": 0.0,
+                        }
+                    ] + pts
+                return {
+                    "ok": True,
+                    "code": code,
+                    "name": d.get("name") or "",
+                    "points": pts,
+                    "source": "eastmoney_fflow_kline",
+                    "ut": ut,
+                }
+            except Exception as e:
+                last_err = e
+                continue
     return {"ok": False, "code": code, "points": [], "error": str(last_err)}
-
 
 def _snap_key(board_type: str) -> str:
     day = _now().strftime("%Y-%m-%d")

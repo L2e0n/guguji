@@ -934,6 +934,39 @@ def sector_dual():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@app.route("/api/sector/intraday", methods=["GET"])
+def sector_intraday():
+    """Multi-board intraday main-force path for chart.
+    Query: type=industry|concept|region, limit=40, primary_only=1, klt=1|5, refresh=0
+    """
+    board_type = (request.args.get("type") or "industry").strip()
+    try:
+        limit = int(request.args.get("limit", 40))
+    except ValueError:
+        limit = 40
+    primary_only = request.args.get("primary_only", "1").lower() not in ("0", "false", "no")
+    try:
+        klt = int(request.args.get("klt", 1))
+    except ValueError:
+        klt = 1
+    refresh = request.args.get("refresh", "").lower() in ("1", "true", "yes")
+    try:
+        return jsonify(
+            sector_flow.intraday_trend(
+                board_type=board_type,
+                limit=limit,
+                primary_only=primary_only,
+                klt=klt,
+                refresh=refresh,
+            )
+        )
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        log.warning("sector intraday failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.route("/api/sector/<code>/members", methods=["GET"])
 def sector_members(code):
     try:

@@ -822,3 +822,389 @@ def intraday_trend(
     _cache_set(cache_key, result, ttl=_INTRADAY_TTL)
     return result
 
+
+# ?? Market volume + limit-up/down overview (????? / ????ST) ??
+EM_ULIST = "https://push2.eastmoney.com/api/qt/ulist.np/get"
+EM_ZT_HOSTS = [
+    "https://push2ex.eastmoney.com/getTopicZTPool",
+    "https://push2exdelay.eastmoney.com/getTopicZTPool",
+]
+EM_DT_HOSTS = [
+    "https://push2ex.eastmoney.com/getTopicDTPool",
+    "https://push2exdelay.eastmoney.com/getTopicDTPool",
+]
+EM_ZB_HOSTS = [
+    "https://push2ex.eastmoney.com/getTopicZBPool",
+    "https://push2exdelay.eastmoney.com/getTopicZBPool",
+]
+_MARKET_TTL = 12.0
+
+
+def _is_st_name(name: str) -> bool:
+    n = (name or "").upper().replace(" ", "")
+    if not n:
+        return False
+    return "ST" in n  # covers ST / *ST / S*ST / SST
+
+
+def _session_progress(now: Optional[datetime] = None) -> dict[str, Any]:
+    """A-share continuous auction progress over 240 trading minutes."""
+    now = now or _now()
+    mins = now.hour * 60 + now.minute + now.second / 60.0
+    m0930, m1130, m1300, m1500 = 9 * 60 + 30, 11 * 60 + 30, 13 * 60, 15 * 60
+    if mins < m0930:
+        elapsed, progress, phase = 0.0, 0.0, "pre"
+    elif mins <= m1130:
+        elapsed = mins - m0930
+        progress = elapsed / 240.0
+        phase = "morning"
+    elif mins < m1300:
+        elapsed, progress, phase = 120.0, 120.0 / 240.0, "lunch"
+    elif mins < m1500:
+        elapsed = 120.0 + (mins - m1300)
+        progress = elapsed / 240.0
+        phase = "afternoon"
+    else:
+        elapsed, progress, phase = 240.0, 1.0, "closed"
+    progress = max(0.0, min(1.0, progress))
+    return {
+        "phase": phase,
+        "elapsed_minutes": round(elapsed, 2),
+        "total_minutes": 240,
+        "progress": round(progress, 4),
+        "progress_pct": round(progress * 100, 2),
+        "remaining_minutes": round(max(0.0, 240.0 - elapsed), 2),
+        "asof_time": now.strftime("%H:%M:%S"),
+        "day": now.strftime("%Y-%m-%d"),
+    }
+
+
+def _predict_full_day(amount: Optional[float], progress: float) -> Optional[float]:
+    if amount is None:
+        return None
+    if progress <= 0.01:
+        return None
+    if progress >= 0.995:
+        return float(amount)
+    # Linear scale by elapsed continuous-auction minutes (240).
+    # Early session is noisy; keep raw linear estimate and expose confidence separately.
+    p = max(float(progress), 0.03)
+    return float(amount) / p
+
+
+def _predict_confidence(progress: float) -> str:
+    if progress >= 0.75:
+        return "high"
+    if progress >= 0.35:
+        return "medium"
+    if progress >= 0.12:
+        return "low"
+    return "very_low"
+
+
+def _fetch_index_quotes() -> list[dict[str, Any]]:
+    session = requests.Session()
+    session.trust_env = False
+    params = {
+        "fltt": "2",
+        "secids": "1.000001,0.399001,0.399006,1.000688,0.899050",
+        "fields": "f12,f14,f2,f3,f6,f8,f104,f105,f106",
+        "ut": EM_UT,
+        "_": int(time.time() * 1000),
+    }
+    hosts = [
+        EM_ULIST,
+        "https://push2delay.eastmoney.com/api/qt/ulist.np/get",
+    ]
+    last_err: Exception | None = None
+    for url in hosts:
+        try:
+            r = session.get(url, params=params, headers=EM_HEADERS, timeout=10)
+            r.raise_for_status()
+            data = r.json()
+            diff = ((data.get("data") or {}).get("diff")) or []
+            if diff:
+                return diff
+        except Exception as e:
+            last_err = e
+            continue
+    if last_err:
+        log.warning("index quotes failed: %s", last_err)
+    return []
+
+
+def _bj_market_amount() -> Optional[float]:
+    """Sum BJ A-share amount (yuan)."""
+    session = requests.Session()
+    session.trust_env = False
+    total_amt = 0.0
+    got = 0
+    page = 1
+    page_size = 200
+    total_n = None
+    while page <= 5:
+        params = {
+            "pn": page,
+            "pz": page_size,
+            "po": 1,
+            "np": 1,
+            "fltt": 2,
+            "invt": 2,
+            "fid": "f6",
+            "fs": "m:0+t:81+s:2048",
+            "fields": "f6,f12",
+            "ut": EM_UT,
+            "_": int(time.time() * 1000),
+        }
+        try:
+            data = _em_get(params, timeout=12.0)
+        except Exception as e:
+            log.warning("BJ amount page %s failed: %s", page, e)
+            break
+        d = data.get("data") or {}
+        if total_n is None:
+            total_n = int(d.get("total") or 0)
+        diff = d.get("diff") or []
+        if not diff:
+            break
+        for row in diff:
+            v = _num(row.get("f6"))
+            if v is not None:
+                total_amt += v
+                got += 1
+        if got >= (total_n or 0) or len(diff) < page_size:
+            break
+        page += 1
+    if got <= 0:
+        return None
+    return total_amt
+
+
+def _fetch_topic_pool(hosts: list[str], date_str: str, pagesize: int = 200, sort: str = "fund:desc") -> list[dict[str, Any]]:
+    session = requests.Session()
+    session.trust_env = False
+    params = {
+        "ut": "7eea3edcaed734bea9cbfc24409ed989",
+        "dpt": "wz.ztzt",
+        "Pageindex": 0,
+        "pagesize": int(pagesize),
+        "sort": sort or "fund:desc",
+        "date": date_str,
+        "_": int(time.time() * 1000),
+    }
+    last_err: Exception | None = None
+    for url in hosts:
+        try:
+            r = session.get(url, params=params, headers=EM_HEADERS, timeout=10)
+            r.raise_for_status()
+            data = r.json()
+            d = data.get("data")
+            if not isinstance(d, dict):
+                continue
+            pool = d.get("pool") or []
+            if isinstance(pool, list):
+                return pool
+        except Exception as e:
+            last_err = e
+            continue
+    if last_err:
+        log.warning("topic pool failed %s: %s", hosts[0], last_err)
+    return []
+
+
+def _pool_stats(pool: list[dict[str, Any]]) -> dict[str, Any]:
+    raw = list(pool or [])
+    non_st = [x for x in raw if not _is_st_name(x.get("n") or "")]
+    st = [x for x in raw if _is_st_name(x.get("n") or "")]
+
+    def _top(items: list[dict[str, Any]], n: int = 8) -> list[dict[str, Any]]:
+        out = []
+        for x in items[:n]:
+            out.append(
+                {
+                    "code": x.get("c"),
+                    "name": x.get("n"),
+                    "change_pct": _num(x.get("zdp")),
+                    "amount_yi": _yi(_num(x.get("amount"))),
+                    "board_count": x.get("lbc") or x.get("days"),
+                    "industry": x.get("hybk"),
+                }
+            )
+        return out
+
+    # ??? heuristic: first seal near 09:25 and never opened (zbc==0)
+    yizi = []
+    for x in non_st:
+        fbt = x.get("fbt")
+        zbc = x.get("zbc")
+        try:
+            fbt_i = int(fbt) if fbt is not None else -1
+        except (TypeError, ValueError):
+            fbt_i = -1
+        try:
+            zbc_i = int(zbc) if zbc is not None else 0
+        except (TypeError, ValueError):
+            zbc_i = 0
+        if zbc_i == 0 and 0 <= fbt_i <= 93000:
+            yizi.append(x)
+
+    # ?? >=2
+    lb2 = []
+    for x in non_st:
+        lbc = x.get("lbc") if x.get("lbc") is not None else x.get("days")
+        try:
+            lbc_i = int(lbc) if lbc is not None else 1
+        except (TypeError, ValueError):
+            lbc_i = 1
+        if lbc_i >= 2:
+            lb2.append(x)
+
+    return {
+        "raw_count": len(raw),
+        "count": len(non_st),
+        "st_count": len(st),
+        "yizi_count": len(yizi),
+        "lb2_count": len(lb2),
+        "top": _top(non_st, 8),
+        "yizi_top": _top(yizi, 6),
+        "lb2_top": _top(sorted(lb2, key=lambda z: int(z.get("lbc") or z.get("days") or 0), reverse=True), 6),
+    }
+
+
+def market_overview(refresh: bool = False) -> dict[str, Any]:
+    """??????? + ?????? + ?????(??ST)?"""
+    cache_key = "market_overview"
+    if not refresh:
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            out = dict(cached)
+            out["cached"] = True
+            return out
+
+    progress = _session_progress()
+    p = float(progress["progress"] or 0)
+
+    quotes = _fetch_index_quotes()
+    by_code = {str(x.get("f12")): x for x in quotes}
+
+    def _idx(code: str, name_fallback: str) -> dict[str, Any]:
+        row = by_code.get(code) or {}
+        amt = _num(row.get("f6"))
+        pred = _predict_full_day(amt, p)
+        return {
+            "code": code,
+            "name": row.get("f14") or name_fallback,
+            "price": _num(row.get("f2")),
+            "change_pct": _num(row.get("f3")),
+            "amount": amt,
+            "amount_yi": _yi(amt),
+            "predict_amount": pred,
+            "predict_amount_yi": _yi(pred) if pred is not None else None,
+            "up_count": int(row["f104"]) if row.get("f104") is not None else None,
+            "down_count": int(row["f105"]) if row.get("f105") is not None else None,
+            "flat_count": int(row["f106"]) if row.get("f106") is not None else None,
+        }
+
+    sh = _idx("000001", "????")
+    sz = _idx("399001", "????")
+    cyb = _idx("399006", "????")
+    kc = _idx("000688", "??50")
+    bj50 = _idx("899050", "??50")
+
+    bj_amt = _bj_market_amount()
+    if bj_amt is None:
+        bj_amt = bj50.get("amount")
+    bj_pred = _predict_full_day(bj_amt, p)
+    bj = {
+        "code": "BJ",
+        "name": "???",
+        "amount": bj_amt,
+        "amount_yi": _yi(bj_amt) if bj_amt is not None else None,
+        "predict_amount": bj_pred,
+        "predict_amount_yi": _yi(bj_pred) if bj_pred is not None else None,
+        "note": "????????" if bj_amt is not None else "????50",
+        "index": bj50,
+    }
+
+    sh_amt = sh.get("amount") or 0.0
+    sz_amt = sz.get("amount") or 0.0
+    bj_a = bj_amt or 0.0
+    hs_amt = sh_amt + sz_amt
+    total_amt = hs_amt + bj_a
+    hs_pred = _predict_full_day(hs_amt, p)
+    total_pred = _predict_full_day(total_amt, p)
+
+    day_key = _now().strftime("%Y%m%d")
+    zt_pool, dt_pool, zb_pool = [], [], []
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        f_zt = pool.submit(_fetch_topic_pool, EM_ZT_HOSTS, day_key, 500, "amount:desc")
+        f_dt = pool.submit(_fetch_topic_pool, EM_DT_HOSTS, day_key, 200, "amount:desc")
+        f_zb = pool.submit(_fetch_topic_pool, EM_ZB_HOSTS, day_key, 200, "amount:desc")
+        try:
+            zt_pool = f_zt.result()
+        except Exception as e:
+            log.warning("zt pool: %s", e)
+        try:
+            dt_pool = f_dt.result()
+        except Exception as e:
+            log.warning("dt pool: %s", e)
+        try:
+            zb_pool = f_zb.result()
+        except Exception as e:
+            log.warning("zb pool: %s", e)
+
+    zt = _pool_stats(zt_pool)
+    dt = _pool_stats(dt_pool)
+    zb = _pool_stats(zb_pool)
+
+    result = {
+        "ok": True,
+        "source": "eastmoney",
+        "asof": _now_iso(),
+        "cached": False,
+        "session": progress,
+        "volume": {
+            "unit": "yi",
+            "sh": sh,
+            "sz": sz,
+            "bj": bj,
+            "cyb": cyb,
+            "kc": kc,
+            "hs": {
+                "name": "????",
+                "amount": hs_amt,
+                "amount_yi": _yi(hs_amt),
+                "predict_amount": hs_pred,
+                "predict_amount_yi": _yi(hs_pred) if hs_pred is not None else None,
+            },
+            "total": {
+                "name": "?????",
+                "amount": total_amt,
+                "amount_yi": _yi(total_amt),
+                "predict_amount": total_pred,
+                "predict_amount_yi": _yi(total_pred) if total_pred is not None else None,
+            },
+            "method": "??=????/????????=?????????????(?240??)",
+            "predict_confidence": _predict_confidence(p),
+        },
+        "limit": {
+            "date": day_key,
+            "exclude_st": True,
+            "limit_up": zt,
+            "limit_down": dt,
+            "broken": zb,
+            "summary": {
+                "limit_up": zt.get("count", 0),
+                "limit_down": dt.get("count", 0),
+                "broken": zb.get("count", 0),
+                "yizi": zt.get("yizi_count", 0),
+                "lb2": zt.get("lb2_count", 0),
+                "st_limit_up": zt.get("st_count", 0),
+                "st_limit_down": dt.get("st_count", 0),
+            },
+            "note": "??/??/??????????????????? ST ???",
+        },
+    }
+    _cache_set(cache_key, result, ttl=_MARKET_TTL)
+    return result
+

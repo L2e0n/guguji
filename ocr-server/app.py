@@ -967,6 +967,17 @@ def sector_intraday():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@app.route("/api/sector/market", methods=["GET"])
+def sector_market():
+    """?????/???? + ?????(?ST)."""
+    refresh = request.args.get("refresh", "").lower() in ("1", "true", "yes")
+    try:
+        return jsonify(sector_flow.market_overview(refresh=refresh))
+    except Exception as e:
+        log.warning("sector market failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.route("/api/sector/<code>/members", methods=["GET"])
 def sector_members(code):
     try:

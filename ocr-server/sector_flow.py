@@ -911,20 +911,32 @@ def _session_progress(now: Optional[datetime] = None) -> dict[str, Any]:
     }
 
 
-def _predict_full_day(amount: Optional[float], progress: float) -> Optional[float]:
+def _predict_full_day_linear(amount: Optional[float], progress: float) -> Optional[float]:
     if amount is None:
         return None
     if progress <= 0.01:
         return None
     if progress >= 0.995:
         return float(amount)
-    # Linear scale by elapsed continuous-auction minutes (240).
-    # Early session is noisy; keep raw linear estimate and expose confidence separately.
     p = max(float(progress), 0.03)
     return float(amount) / p
 
 
-def _predict_confidence(progress: float) -> str:
+# backward-compatible alias
+def _predict_full_day(amount: Optional[float], progress: float) -> Optional[float]:
+    return _predict_full_day_linear(amount, progress)
+
+
+def _predict_confidence(progress: float, method: str = "linear") -> str:
+    """Profile method is more trustworthy earlier in the session."""
+    if method == "profile":
+        if progress >= 0.55:
+            return "high"
+        if progress >= 0.20:
+            return "medium"
+        if progress >= 0.08:
+            return "low"
+        return "very_low"
     if progress >= 0.75:
         return "high"
     if progress >= 0.35:
@@ -932,6 +944,207 @@ def _predict_confidence(progress: float) -> str:
     if progress >= 0.12:
         return "low"
     return "very_low"
+
+
+def _hhmm_from_any(tm: str) -> str:
+    s = (tm or "").strip()
+    if not s:
+        return "09:30"
+    parts = s.replace("：", ":").split(":")
+    try:
+        h = int(parts[0])
+        m = int(parts[1]) if len(parts) > 1 else 0
+        return f"{h:02d}:{m:02d}"
+    except Exception:
+        return s[:5] if len(s) >= 5 else "09:30"
+
+
+def _hhmm_to_session_idx(hhmm: str) -> Optional[int]:
+    """Map HH:MM to continuous-auction minute index 0..239."""
+    try:
+        hh, mm = _hhmm_from_any(hhmm).split(":")[:2]
+        h, m = int(hh), int(mm)
+    except Exception:
+        return None
+    mins = h * 60 + m
+    m0930, m1130, m1300, m1500 = 9 * 60 + 30, 11 * 60 + 30, 13 * 60, 15 * 60
+    if mins < m0930:
+        return 0
+    if mins <= m1130:
+        return mins - m0930
+    if mins < m1300:
+        return 120
+    if mins <= m1500:
+        return 120 + (mins - m1300)
+    return 239
+
+
+def _parse_trends_amounts(trends: list) -> dict[str, list[tuple[str, float]]]:
+    """day -> [(HH:MM, minute_amount_yuan), ...]"""
+    by_day: dict[str, list[tuple[str, float]]] = {}
+    for line in trends or []:
+        if not isinstance(line, str):
+            continue
+        parts = line.split(",")
+        if len(parts) < 7:
+            continue
+        head = parts[0].strip()
+        if " " not in head:
+            continue
+        day, tm = head.split(" ", 1)
+        tm = _hhmm_from_any(tm)
+        amt = _num(parts[6])
+        if amt is None:
+            continue
+        by_day.setdefault(day, []).append((tm, float(amt)))
+    for day in by_day:
+        by_day[day].sort(key=lambda x: _hhmm_to_session_idx(x[0]) or 0)
+    return by_day
+
+
+def _fetch_index_trends(secid: str, ndays: int = 5) -> list:
+    """Multi-day 1-min trends from Eastmoney his (includes amount)."""
+    session = requests.Session()
+    session.trust_env = False
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        ),
+        "Referer": "https://quote.eastmoney.com/",
+        "Accept": "*/*",
+    }
+    params = {
+        "fields1": "f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58",
+        "ut": "fa5fd1943c7b386f172d6893dbfba10b",
+        "ndays": int(ndays),
+        "iscr": 0,
+        "secid": secid,
+        "_": int(time.time() * 1000),
+    }
+    hosts = [
+        "https://push2his.eastmoney.com/api/qt/stock/trends2/get",
+        "https://push2.eastmoney.com/api/qt/stock/trends2/get",
+    ]
+    last_err: Exception | None = None
+    for url in hosts:
+        try:
+            r = session.get(url, params=params, headers=headers, timeout=12)
+            r.raise_for_status()
+            data = r.json()
+            trends = ((data.get("data") or {}).get("trends")) or []
+            if trends:
+                return trends
+        except Exception as e:
+            last_err = e
+            continue
+    if last_err:
+        log.warning("index trends %s failed: %s", secid, last_err)
+    return []
+
+
+def _avg_cum_ratio_curve(
+    by_day: dict[str, list[tuple[str, float]]], exclude_day: str
+) -> dict[int, float]:
+    """Average cumulative volume share by session minute index (completed hist days)."""
+    buckets: dict[int, list[float]] = {}
+    for day, pts in by_day.items():
+        if day == exclude_day:
+            continue
+        if len(pts) < 200:  # incomplete day, skip
+            continue
+        total = sum(a for _, a in pts)
+        if total <= 0:
+            continue
+        cum = 0.0
+        day_ratio: dict[int, float] = {}
+        for tm, amt in pts:
+            idx = _hhmm_to_session_idx(tm)
+            if idx is None:
+                continue
+            cum += amt
+            day_ratio[idx] = cum / total
+        if not day_ratio:
+            continue
+        for idx in range(0, 240):
+            if idx in day_ratio:
+                r = day_ratio[idx]
+            else:
+                prev = [i for i in day_ratio if i <= idx]
+                r = day_ratio[max(prev)] if prev else 0.0
+            buckets.setdefault(idx, []).append(r)
+    curve: dict[int, float] = {}
+    for idx, vals in buckets.items():
+        if vals:
+            curve[idx] = sum(vals) / len(vals)
+    return curve
+
+
+def _ratio_at(curve: dict[int, float], hhmm: str) -> Optional[float]:
+    idx = _hhmm_to_session_idx(hhmm)
+    if idx is None or not curve:
+        return None
+    if idx in curve:
+        return curve[idx]
+    prev = [i for i in curve if i <= idx]
+    if prev:
+        return curve[max(prev)]
+    nxt = [i for i in curve if i >= idx]
+    if nxt:
+        return curve[min(nxt)]
+    return None
+
+
+def _predict_by_profile(
+    amount: Optional[float],
+    hhmm: str,
+    curve: dict[int, float],
+    progress: float,
+) -> tuple[Optional[float], str, Optional[float]]:
+    """Return (predict_amount, method, ratio_used)."""
+    if amount is None:
+        return None, "none", None
+    if progress >= 0.995:
+        return float(amount), "closed", 1.0
+    ratio = _ratio_at(curve, hhmm)
+    if ratio is not None and ratio >= 0.06:
+        ratio = max(0.06, min(0.995, float(ratio)))
+        return float(amount) / ratio, "profile", ratio
+    pred = _predict_full_day_linear(amount, progress)
+    return pred, "linear", progress if progress > 0 else None
+
+
+def _blend_curves(*curves: dict[int, float]) -> dict[int, float]:
+    out: dict[int, float] = {}
+    for idx in range(0, 240):
+        vals = [c[idx] for c in curves if idx in c]
+        if vals:
+            out[idx] = sum(vals) / len(vals)
+    return out
+
+
+def _get_volume_profiles(today: str) -> tuple[dict[int, float], dict[int, float], dict[int, float]]:
+    """Cached SH/SZ/HS cumulative-volume-ratio curves (exclude today)."""
+    cache_key = f"vol_profile:{today}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached["sh"], cached["sz"], cached["hs"]
+    sh_curve: dict[int, float] = {}
+    sz_curve: dict[int, float] = {}
+    try:
+        sh_by = _parse_trends_amounts(_fetch_index_trends("1.000001", ndays=5))
+        sz_by = _parse_trends_amounts(_fetch_index_trends("0.399001", ndays=5))
+        sh_curve = _avg_cum_ratio_curve(sh_by, exclude_day=today)
+        sz_curve = _avg_cum_ratio_curve(sz_by, exclude_day=today)
+    except Exception as e:
+        log.warning("volume profile build failed: %s", e)
+    hs_curve = _blend_curves(sh_curve, sz_curve)
+    payload = {"sh": sh_curve, "sz": sz_curve, "hs": hs_curve}
+    # historical profiles are stable intraday
+    _cache_set(cache_key, payload, ttl=1800.0)
+    return sh_curve, sz_curve, hs_curve
 
 
 def _fetch_index_quotes() -> list[dict[str, Any]]:
@@ -1118,11 +1331,15 @@ def market_overview(refresh: bool = False) -> dict[str, Any]:
 
     quotes = _fetch_index_quotes()
     by_code = {str(x.get("f12")): x for x in quotes}
+    now_hhmm = (progress.get("asof_time") or "09:30")[:5]
+    today = progress.get("day") or _now().strftime("%Y-%m-%d")
+    sh_curve, sz_curve, hs_curve = _get_volume_profiles(today)
 
-    def _idx(code: str, name_fallback: str) -> dict[str, Any]:
+    def _idx(code: str, name_fallback: str, curve: Optional[dict[int, float]] = None) -> dict[str, Any]:
         row = by_code.get(code) or {}
         amt = _num(row.get("f6"))
-        pred = _predict_full_day(amt, p)
+        use_curve = curve if curve is not None else hs_curve
+        pred, method, ratio = _predict_by_profile(amt, now_hhmm, use_curve, p)
         return {
             "code": code,
             "name": row.get("f14") or name_fallback,
@@ -1132,29 +1349,33 @@ def market_overview(refresh: bool = False) -> dict[str, Any]:
             "amount_yi": _yi(amt),
             "predict_amount": pred,
             "predict_amount_yi": _yi(pred) if pred is not None else None,
+            "predict_method": method,
+            "profile_ratio": round(ratio, 4) if ratio is not None else None,
             "up_count": int(row["f104"]) if row.get("f104") is not None else None,
             "down_count": int(row["f105"]) if row.get("f105") is not None else None,
             "flat_count": int(row["f106"]) if row.get("f106") is not None else None,
         }
 
-    sh = _idx("000001", "????")
-    sz = _idx("399001", "????")
-    cyb = _idx("399006", "????")
-    kc = _idx("000688", "??50")
-    bj50 = _idx("899050", "??50")
+    sh = _idx("000001", "上证指数", sh_curve)
+    sz = _idx("399001", "深证成指", sz_curve)
+    cyb = _idx("399006", "创业板指", sz_curve)
+    kc = _idx("000688", "科创50", sh_curve)
+    bj50 = _idx("899050", "北证50", hs_curve)
 
     bj_amt = _bj_market_amount()
     if bj_amt is None:
         bj_amt = bj50.get("amount")
-    bj_pred = _predict_full_day(bj_amt, p)
+    bj_pred, bj_method, bj_ratio = _predict_by_profile(bj_amt, now_hhmm, hs_curve, p)
     bj = {
         "code": "BJ",
-        "name": "???",
+        "name": "北交所",
         "amount": bj_amt,
         "amount_yi": _yi(bj_amt) if bj_amt is not None else None,
         "predict_amount": bj_pred,
         "predict_amount_yi": _yi(bj_pred) if bj_pred is not None else None,
-        "note": "????????" if bj_amt is not None else "????50",
+        "predict_method": bj_method,
+        "profile_ratio": round(bj_ratio, 4) if bj_ratio is not None else None,
+        "note": "全市场成交额汇总" if bj_amt is not None else "回退北证50",
         "index": bj50,
     }
 
@@ -1163,8 +1384,8 @@ def market_overview(refresh: bool = False) -> dict[str, Any]:
     bj_a = bj_amt or 0.0
     hs_amt = sh_amt + sz_amt
     total_amt = hs_amt + bj_a
-    hs_pred = _predict_full_day(hs_amt, p)
-    total_pred = _predict_full_day(total_amt, p)
+    hs_pred, hs_method, hs_ratio = _predict_by_profile(hs_amt, now_hhmm, hs_curve, p)
+    total_pred, total_method, total_ratio = _predict_by_profile(total_amt, now_hhmm, hs_curve, p)
 
     day_key = _now().strftime("%Y%m%d")
     zt_pool, dt_pool, zb_pool = [], [], []
@@ -1203,21 +1424,27 @@ def market_overview(refresh: bool = False) -> dict[str, Any]:
             "cyb": cyb,
             "kc": kc,
             "hs": {
-                "name": "????",
+                "name": "沪深两市",
                 "amount": hs_amt,
                 "amount_yi": _yi(hs_amt),
                 "predict_amount": hs_pred,
                 "predict_amount_yi": _yi(hs_pred) if hs_pred is not None else None,
+                "predict_method": hs_method,
+                "profile_ratio": round(hs_ratio, 4) if hs_ratio is not None else None,
             },
             "total": {
-                "name": "?????",
+                "name": "沪深京合计",
                 "amount": total_amt,
                 "amount_yi": _yi(total_amt),
                 "predict_amount": total_pred,
                 "predict_amount_yi": _yi(total_pred) if total_pred is not None else None,
+                "predict_method": total_method,
+                "profile_ratio": round(total_ratio, 4) if total_ratio is not None else None,
             },
-            "method": "??=????/????????=?????????????(?240??)",
-            "predict_confidence": _predict_confidence(p),
+            "method": "实际=东财指数成交额；预测=当前额/近几日同时刻累计成交占比(量能曲线)，缺历史时回退线性外推",
+            "predict_confidence": _predict_confidence(p, method=total_method if total_method != "none" else "linear"),
+            "profile_minutes": len(hs_curve),
+            "asof_hhmm": now_hhmm,
         },
         "limit": {
             "date": day_key,
@@ -1234,7 +1461,7 @@ def market_overview(refresh: bool = False) -> dict[str, Any]:
                 "st_limit_up": zt.get("st_count", 0),
                 "st_limit_down": dt.get("st_count", 0),
             },
-            "note": "??/??/??????????????????? ST ???",
+            "note": "涨停/跌停/炸板来自东财主题池，统计已剔除 ST 名称",
         },
     }
     _cache_set(cache_key, result, ttl=_MARKET_TTL)

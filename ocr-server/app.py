@@ -29,6 +29,7 @@ import requests
 import qdii_service
 import qdii_radar
 import sector_flow
+import dark_flow
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("guguji-ocr")
@@ -954,6 +955,42 @@ def sector_members(code):
         return jsonify({"ok": False, "error": str(e)}), 400
     except Exception as e:
         log.warning("sector members failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+
+
+@app.route("/api/dark/health", methods=["GET"])
+def dark_health():
+    try:
+        return jsonify(dark_flow.health())
+    except Exception as e:
+        log.warning("dark health failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/dark/rank", methods=["GET"])
+def dark_rank():
+    try:
+        sort = request.args.get("sort", "dark_in")
+        limit = request.args.get("limit", 30)
+        page = request.args.get("page", 1)
+        refresh = request.args.get("refresh", "0") in ("1", "true", "True", "yes")
+        return jsonify(dark_flow.rank(sort=sort, limit=limit, page=page, refresh=refresh))
+    except Exception as e:
+        log.warning("dark rank failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/dark/query", methods=["GET"])
+def dark_query():
+    try:
+        q = request.args.get("q") or request.args.get("query") or ""
+        return jsonify(dark_flow.query_stock(q))
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        log.warning("dark query failed: %s", e)
         return jsonify({"ok": False, "error": str(e)}), 500
 
 

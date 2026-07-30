@@ -1123,7 +1123,7 @@ def _parse_trends_amounts(trends: list) -> dict[str, list[tuple[str, float]]]:
     return by_day
 
 
-def _fetch_index_trends(secid: str, ndays: int = 5, retries: int = 3) -> list:
+def _fetch_index_trends(secid: str, ndays: int = 5, retries: int = 1) -> list:
     """Multi-day 1-min trends from Eastmoney his (includes amount). Retries + dual hosts."""
     session = requests.Session()
     session.trust_env = False
@@ -1156,7 +1156,7 @@ def _fetch_index_trends(secid: str, ndays: int = 5, retries: int = 3) -> list:
         params["_"] = int(time.time() * 1000)
         for url in hosts:
             try:
-                r = session.get(url, params=params, headers=headers, timeout=12)
+                r = session.get(url, params=params, headers=headers, timeout=6)
                 r.raise_for_status()
                 data = r.json()
                 trends = ((data.get("data") or {}).get("trends")) or []
@@ -1230,6 +1230,7 @@ def _predict_by_profile(
     hhmm: str,
     curve: dict[int, float],
     progress: float,
+    method_label: str = "profile",
 ) -> tuple[Optional[float], str, Optional[float]]:
     """Return (predict_amount, method, ratio_used). No linear fallback."""
     if amount is None:
@@ -1239,8 +1240,41 @@ def _predict_by_profile(
     ratio = _ratio_at(curve, hhmm)
     if ratio is not None and ratio >= 0.06:
         ratio = max(0.06, min(0.995, float(ratio)))
-        return float(amount) / ratio, "profile", ratio
+        label = method_label if method_label else "profile"
+        return float(amount) / ratio, label, ratio
     return None, "unavailable", None
+
+
+def _builtin_session_curve() -> dict[int, float]:
+    """Typical A-share cumulative volume share by session minute (0..239).
+
+    Not a linear amount/progress model: denser open + lunch reopen + close auction
+    ramp. Used when Eastmoney minute curves are unavailable and no disk last-good.
+    """
+    dens: list[float] = []
+    for i in range(240):
+        if i < 30:  # 09:30-10:00 open rush
+            d = 2.35 - i * 0.028
+        elif i < 120:  # morning body
+            d = 1.25 - (i - 30) * 0.0055
+        elif i < 150:  # 13:00-13:30 soft reopen
+            d = 0.95 + (i - 120) * 0.008
+        elif i < 210:  # afternoon body
+            d = 1.15 + (i - 150) * 0.004
+        else:  # last 30m ramp
+            d = 1.4 + (i - 210) * 0.03
+        dens.append(max(0.35, float(d)))
+    total = sum(dens) or 1.0
+    cum = 0.0
+    curve: dict[int, float] = {}
+    for i, d in enumerate(dens):
+        cum += d
+        curve[i] = cum / total
+    curve[239] = 1.0
+    return curve
+
+
+_BUILTIN_SESSION_CURVE = _builtin_session_curve()
 
 
 def _blend_curves(*curves: dict[int, float]) -> dict[int, float]:
@@ -1413,7 +1447,11 @@ def _hithink_index_amounts() -> dict[str, Any]:
     if not _hithink_api_key():
         return {"ok": False, "error": "no_api_key"}
     try:
-        data = _hithink_query("上证指数,深证成指,北证50 成交额 涨跌幅", limit=10, timeout=28)
+        data = _hithink_query(
+            "上证指数,深证成指,北证50,创业板指,科创50 成交额 涨跌幅 最新价",
+            limit=20,
+            timeout=28,
+        )
         rows = data.get("datas") or []
         out: dict[str, Any] = {
             "ok": True,
@@ -1421,6 +1459,8 @@ def _hithink_index_amounts() -> dict[str, Any]:
             "sh": None,
             "sz": None,
             "bj": None,
+            "cyb": None,
+            "kc50": None,
             "raw_count": len(rows),
         }
         for row in rows:
@@ -1428,17 +1468,29 @@ def _hithink_index_amounts() -> dict[str, Any]:
                 continue
             code = str(_hithink_pick(row, "指数代码", "code") or "")
             name = str(_hithink_pick(row, "指数简称", "name") or "")
+            # 成交额[YYYYMMDD] preferred for today snapshot
             amt = _hithink_float(_hithink_pick(row, "成交额", "amount"))
+            if amt is None:
+                for k, v in row.items():
+                    ks = str(k)
+                    if ks.startswith("成交额") or "成交额[" in ks:
+                        amt = _hithink_float(v)
+                        if amt is not None:
+                            break
             chg = _hithink_float(_hithink_pick(row, "涨跌幅", "最新涨跌幅", "change"))
             price = _hithink_float(_hithink_pick(row, "最新价", "price"))
             item = {"amount": amt, "change_pct": chg, "price": price, "name": name, "code": code}
             code_u = code.upper()
-            if "000001" in code_u or "上证" in name:
+            if "000001" in code_u or name == "上证指数" or ("上证" in name and "综" not in name and "50" not in name):
                 out["sh"] = item
-            elif "399001" in code_u or "深证" in name:
+            elif "399001" in code_u or "深证成" in name:
                 out["sz"] = item
-            elif "899050" in code_u or "北证" in name:
+            elif "899050" in code_u or "北证50" in name or name == "北证50":
                 out["bj"] = item
+            elif "399006" in code_u or "创业板" in name:
+                out["cyb"] = item
+            elif "000688" in code_u or "科创50" in name:
+                out["kc50"] = item
         _cache_set(cache_key, out, ttl=40.0, stale=300.0)
         return out
     except Exception as e:
@@ -1494,10 +1546,14 @@ def _hithink_prev_day_amounts(prev_day: Optional[str]) -> dict[str, Any]:
 def _get_volume_profiles(today: str) -> dict[str, Any]:
     """Cached SH/SZ/HS ratio curves + previous complete-day totals.
 
-    Primary: Eastmoney trends2 (with retries).
-    Backup curve: last-good disk profile.
-    Backup prev totals / validation: hithink (问财) when configured.
-    Empty results only short-cached so recovery is fast.
+    Curve priority:
+      1) Eastmoney trends2 (fail-fast)
+      2) disk last-good
+      3) builtin A-share session profile (always available; NOT linear)
+    Prev-day totals:
+      1) EM complete days if any
+      2) disk
+      3) hithink/问财 (primary backup when EM down)
     """
     cache_key = f"vol_profile:{today}"
     cached = _cache_get(cache_key)
@@ -1512,9 +1568,8 @@ def _get_volume_profiles(today: str) -> dict[str, Any]:
     em_error = None
 
     try:
-        # parallel-ish sequential with retries inside fetch
-        sh_by = _parse_trends_amounts(_fetch_index_trends("1.000001", ndays=5, retries=3))
-        sz_by = _parse_trends_amounts(_fetch_index_trends("0.399001", ndays=5, retries=3))
+        sh_by = _parse_trends_amounts(_fetch_index_trends("1.000001", ndays=5, retries=1))
+        sz_by = _parse_trends_amounts(_fetch_index_trends("0.399001", ndays=5, retries=1))
         sh_curve = _avg_cum_ratio_curve(sh_by, exclude_day=today)
         sz_curve = _avg_cum_ratio_curve(sz_by, exclude_day=today)
         if sh_curve or sz_curve:
@@ -1554,9 +1609,22 @@ def _get_volume_profiles(today: str) -> dict[str, Any]:
                 if prev_hs is not None:
                     prev_source = "disk_cache"
 
-    # Hithink backup for previous day totals (vs_prev)
+    # Always-available non-linear session profile (no waiting for EM)
+    if len(hs_curve) < 30:
+        sh_curve = dict(_BUILTIN_SESSION_CURVE)
+        sz_curve = dict(_BUILTIN_SESSION_CURVE)
+        hs_curve = dict(_BUILTIN_SESSION_CURVE)
+        profile_source = "builtin"
+
+    # EM sometimes returns only SZ (or only SH). Never leave a side empty when HS exists.
+    if len(hs_curve) >= 30:
+        if len(sh_curve) < 30:
+            sh_curve = dict(hs_curve)
+        if len(sz_curve) < 30:
+            sz_curve = dict(hs_curve)
+
+    # Hithink for previous day totals (vs_prev) — prefer when EM history missing
     if prev_hs is None:
-        # guess prev trading day from calendar (simple: yesterday, skip weekends lightly)
         guess = None
         try:
             d0 = datetime.strptime(today, "%Y-%m-%d")
@@ -1575,7 +1643,6 @@ def _get_volume_profiles(today: str) -> dict[str, Any]:
             prev_hs = ht.get("prev_hs")
             prev_source = "hithink"
 
-    # If still no prev_day label but have amounts from disk/em, keep as-is
     payload: dict[str, Any] = {
         "sh": sh_curve,
         "sz": sz_curve,
@@ -1588,12 +1655,17 @@ def _get_volume_profiles(today: str) -> dict[str, Any]:
         "prev_source": prev_source,
         "em_error": em_error,
         "curve_points": len(hs_curve),
+        "method_label": (
+            "profile" if profile_source == "eastmoney"
+            else ("profile_cache" if profile_source == "disk_cache" else "profile_builtin")
+        ),
     }
 
     ok_curve = len(hs_curve) >= 30
     if ok_curve and profile_source == "eastmoney":
         _save_disk_profile(payload)
 
+    # builtin/disk also long-TTL (usable); only pure-empty short cache
     ttl = VOL_PROFILE_TTL_OK if ok_curve else VOL_PROFILE_TTL_EMPTY
     _cache_set(cache_key, payload, ttl=ttl, stale=max(ttl, 300.0))
     return payload
@@ -1800,34 +1872,60 @@ def _market_overview_fresh(cache_key: str, refresh: bool = False) -> dict[str, A
 
     quotes = _fetch_index_quotes()
     by_code = {str(x.get("f12")): x for x in quotes}
-    amount_source = "eastmoney"
-    # Hithink backup for live index amounts when EM quote amount missing
-    ht_amt = None
-    def _ensure_amount(code: str, ht_key: str) -> None:
-        nonlocal amount_source, ht_amt
-        row = by_code.get(code) or {}
-        if _num(row.get("f6")) is not None:
-            return
-        if ht_amt is None:
-            ht_amt = _hithink_index_amounts()
+    amount_source = "eastmoney" if quotes else "none"
+    # Prefer hithink amounts when configured (EM often blocked on cloud hosts)
+    ht_amt = _hithink_index_amounts() if _hithink_api_key() else {"ok": False}
+
+    def _apply_ht(code: str, ht_key: str, prefer: bool = False) -> None:
+        nonlocal amount_source
         item = (ht_amt or {}).get(ht_key) or {}
         amt = item.get("amount")
         if amt is None:
             return
-        # synthesize minimal EM-like row
+        row = by_code.get(code) or {}
+        em_amt = _num(row.get("f6"))
+        if (not prefer) and em_amt is not None:
+            return
         if code not in by_code:
             by_code[code] = {"f12": code, "f14": item.get("name") or code}
         by_code[code]["f6"] = amt
-        if item.get("change_pct") is not None and by_code[code].get("f3") is None:
-            by_code[code]["f3"] = item.get("change_pct")
-        if item.get("price") is not None and by_code[code].get("f2") is None:
-            by_code[code]["f2"] = item.get("price")
-        amount_source = "hithink" if amount_source == "eastmoney" and not quotes else (
-            "mixed" if quotes else "hithink"
-        )
-    _ensure_amount("000001", "sh")
-    _ensure_amount("399001", "sz")
-    _ensure_amount("899050", "bj")
+        if item.get("change_pct") is not None:
+            if prefer or by_code[code].get("f3") is None:
+                by_code[code]["f3"] = item.get("change_pct")
+        if item.get("price") is not None:
+            if prefer or by_code[code].get("f2") is None:
+                by_code[code]["f2"] = item.get("price")
+        if item.get("name") and not by_code[code].get("f14"):
+            by_code[code]["f14"] = item.get("name")
+        if prefer:
+            # preferred path: report hithink even if EM quote shells exist for name/price
+            amount_source = "hithink"
+        elif amount_source == "eastmoney" and em_amt is None:
+            amount_source = "mixed" if quotes else "hithink"
+        elif amount_source == "none":
+            amount_source = "hithink"
+
+    # Always prefer hithink amounts when API key is configured (do not wait for EM recovery).
+    # EM quotes remain gap-fill only if hithink misses a field.
+    prefer_ht = bool(_hithink_api_key()) and bool((ht_amt or {}).get("ok"))
+    # Overlay hithink when prefer; otherwise fill gaps only
+    for code, key in (
+        ("000001", "sh"),
+        ("399001", "sz"),
+        ("899050", "bj"),
+        ("399006", "cyb"),
+        ("000688", "kc50"),
+    ):
+        _apply_ht(code, key, prefer=prefer_ht)
+    # gap fill for any still missing
+    for code, key in (
+        ("000001", "sh"),
+        ("399001", "sz"),
+        ("899050", "bj"),
+        ("399006", "cyb"),
+        ("000688", "kc50"),
+    ):
+        _apply_ht(code, key, prefer=False)
 
     now_hhmm = (progress.get("asof_time") or "09:30")[:5]
     today = progress.get("day") or _now().strftime("%Y-%m-%d")
@@ -1837,12 +1935,13 @@ def _market_overview_fresh(cache_key: str, refresh: bool = False) -> dict[str, A
     hs_curve = prof.get("hs") or {}
     prev_day = prof.get("prev_day")
     prev_hs = prof.get("prev_hs")
+    method_label = str(prof.get("method_label") or "profile")
 
     def _idx(code: str, name_fallback: str, curve: Optional[dict[int, float]] = None) -> dict[str, Any]:
         row = by_code.get(code) or {}
         amt = _num(row.get("f6"))
         use_curve = curve if curve is not None else hs_curve
-        pred, method, ratio = _predict_by_profile(amt, now_hhmm, use_curve, p)
+        pred, method, ratio = _predict_by_profile(amt, now_hhmm, use_curve, p, method_label=method_label)
         return {
             "code": code,
             "name": row.get("f14") or name_fallback,
@@ -1869,7 +1968,7 @@ def _market_overview_fresh(cache_key: str, refresh: bool = False) -> dict[str, A
     bj_amt = _bj_market_amount()
     if bj_amt is None:
         bj_amt = bj50.get("amount")
-    bj_pred, bj_method, bj_ratio = _predict_by_profile(bj_amt, now_hhmm, hs_curve, p)
+    bj_pred, bj_method, bj_ratio = _predict_by_profile(bj_amt, now_hhmm, hs_curve, p, method_label=method_label)
     bj = {
         "code": "BJ",
         "name": "北交所",
@@ -1888,8 +1987,8 @@ def _market_overview_fresh(cache_key: str, refresh: bool = False) -> dict[str, A
     bj_a = bj_amt or 0.0
     hs_amt = sh_amt + sz_amt
     total_amt = hs_amt + bj_a
-    hs_pred, hs_method, hs_ratio = _predict_by_profile(hs_amt, now_hhmm, hs_curve, p)
-    total_pred, total_method, total_ratio = _predict_by_profile(total_amt, now_hhmm, hs_curve, p)
+    hs_pred, hs_method, hs_ratio = _predict_by_profile(hs_amt, now_hhmm, hs_curve, p, method_label=method_label)
+    total_pred, total_method, total_ratio = _predict_by_profile(total_amt, now_hhmm, hs_curve, p, method_label=method_label)
 
     # 较昨日放量/缩量：盘中用预测全天 vs 上一完整交易日沪深成交额；收盘后用实际
     vs_prev: dict[str, Any] = {
@@ -1995,7 +2094,7 @@ def _market_overview_fresh(cache_key: str, refresh: bool = False) -> dict[str, A
                 "predict_method": total_method,
                 "profile_ratio": round(total_ratio, 4) if total_ratio is not None else None,
             },
-            "method": "实际=东财指数成交额(失败则问财/hithink备份)；预测=当前额/近几日同时刻累计成交占比(量能曲线)；东财曲线失败用本地last-good；无曲线则不预测(已取消线性回退)",
+            "method": "实际=优先问财/hithink成交额(东财可用则混合)；预测=当前额/同时刻累计成交占比曲线(东财分时→磁盘last-good→内置A股量能曲线，非线性)；前日对比优先问财；已取消线性回退",
             "predict_confidence": _predict_confidence(p, method=total_method if total_method not in (None, "none") else "unavailable"),
             "profile_minutes": len(hs_curve),
             "profile_source": prof.get("profile_source") or ("eastmoney" if hs_curve else "none"),

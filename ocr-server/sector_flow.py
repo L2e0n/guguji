@@ -1501,42 +1501,72 @@ def _hithink_index_amounts() -> dict[str, Any]:
         return {"ok": False, "error": str(e)}
 
 
+def _hithink_row_amount(row: dict[str, Any], day_compact: Optional[str] = None) -> Optional[float]:
+    """Parse amount fields including date-tagged amount[YYYYMMDD]."""
+    if not isinstance(row, dict):
+        return None
+    amt_key = "成交额"
+    preferred: list[str] = []
+    if day_compact:
+        preferred.append(f"{amt_key}[{day_compact}]")
+    preferred.extend([amt_key, "amount"])
+    amt = _hithink_float(_hithink_pick(row, *preferred))
+    if amt is not None:
+        return amt
+    tagged: list[tuple[str, float]] = []
+    for k, v in row.items():
+        ks = str(k)
+        if ks == amt_key or ks.startswith(amt_key + "[") or (amt_key + "[") in ks:
+            fv = _hithink_float(v)
+            if fv is not None:
+                tagged.append((ks, fv))
+    if not tagged:
+        return None
+    if day_compact:
+        for ks, fv in tagged:
+            if day_compact in ks:
+                return fv
+    tagged.sort(key=lambda x: x[0], reverse=True)
+    return tagged[0][1]
+
+
 def _hithink_prev_day_amounts(prev_day: Optional[str]) -> dict[str, Any]:
-    """Try fetch previous complete-day index amounts from hithink (yuan)."""
+    """Fetch previous complete-day SH+SZ index amounts from hithink."""
     if not prev_day or not _hithink_api_key():
         return {"ok": False}
     cache_key = f"hithink_prev:{prev_day}"
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
-    # 问财 date-tagged fields: 成交额[YYYYMMDD]
     dcompact = prev_day.replace("-", "")
+    sh_name = "上证指数"
+    sz_name = "深证成指"
+    sh_token = "上证"
+    sz_token = "深证成"
+    code_key = "指数代码"
+    name_key = "指数简称"
+    amt_key = "成交额"
     try:
-        q = f"上证指数,深证成指 成交额[{dcompact}]"
+        q = f"{sh_name},{sz_name} {amt_key}[{dcompact}]"
         data = _hithink_query(q, limit=10, timeout=28)
         rows = data.get("datas") or []
         sh = sz = None
         for row in rows:
             if not isinstance(row, dict):
                 continue
-            code = str(_hithink_pick(row, "指数代码", "code") or "")
-            name = str(_hithink_pick(row, "指数简称", "name") or "")
-            amt = _hithink_float(_hithink_pick(row, "成交额", "amount"))
+            code = str(_hithink_pick(row, code_key, "code") or "").upper()
+            name = str(_hithink_pick(row, name_key, "name") or "")
+            amt = _hithink_row_amount(row, dcompact)
             if amt is None:
                 continue
-            if "000001" in code.upper() or "上证" in name:
+            if "000001" in code or name == sh_name or (sh_token in name and "深" not in name and "50" not in name and "综" not in name):
                 sh = float(amt)
-            elif "399001" in code.upper() or "深证" in name:
+            elif "399001" in code or sz_token in name:
                 sz = float(amt)
-        out = {
-            "ok": bool(sh or sz),
-            "source": "hithink",
-            "prev_day": prev_day,
-            "prev_sh": sh,
-            "prev_sz": sz,
-            "prev_hs": (float(sh or 0) + float(sz or 0)) if (sh or sz) else None,
-        }
-        _cache_set(cache_key, out, ttl=3600.0, stale=7200.0)
+        ok = sh is not None and sz is not None and sh > 0 and sz > 0
+        out = {"ok": ok, "source": "hithink", "prev_day": prev_day, "prev_sh": sh, "prev_sz": sz, "prev_hs": (float(sh) + float(sz)) if ok else None}
+        if ok:
+            _cache_set(cache_key, out, ttl=3600.0, stale=7200.0)
         return out
     except Exception as e:
         log.warning("hithink prev day amounts failed: %s", e)
@@ -1584,13 +1614,14 @@ def _get_volume_profiles(today: str) -> dict[str, Any]:
     sz_days = _complete_day_totals(sz_by, exclude_day=today)
     sh_map = {d: a for d, a in sh_days}
     sz_map = {d: a for d, a in sz_days}
+    # ????????????????????????
     common = sorted(set(sh_map) & set(sz_map), reverse=True)
-    prev_day = common[0] if common else (sh_days[0][0] if sh_days else (sz_days[0][0] if sz_days else None))
+    prev_day = common[0] if common else None
     prev_sh = sh_map.get(prev_day) if prev_day else None
     prev_sz = sz_map.get(prev_day) if prev_day else None
     prev_hs = None
-    if prev_sh is not None or prev_sz is not None:
-        prev_hs = float(prev_sh or 0.0) + float(prev_sz or 0.0)
+    if prev_sh is not None and prev_sz is not None:
+        prev_hs = float(prev_sh) + float(prev_sz)
     prev_source = "eastmoney" if prev_hs else "none"
 
     # Backup curve from disk last-good if EM empty
@@ -1602,11 +1633,14 @@ def _get_volume_profiles(today: str) -> dict[str, Any]:
             hs_curve = disk.get("hs") or hs_curve
             profile_source = "disk_cache"
             if prev_hs is None:
-                prev_day = disk.get("prev_day") or prev_day
-                prev_sh = disk.get("prev_sh") if disk.get("prev_sh") is not None else prev_sh
-                prev_sz = disk.get("prev_sz") if disk.get("prev_sz") is not None else prev_sz
-                prev_hs = disk.get("prev_hs") if disk.get("prev_hs") is not None else prev_hs
-                if prev_hs is not None:
+                d_sh = disk.get("prev_sh")
+                d_sz = disk.get("prev_sz")
+                # reject polluted cache where only one market was stored as HS
+                if d_sh is not None and d_sz is not None and float(d_sh) > 0 and float(d_sz) > 0:
+                    prev_day = disk.get("prev_day") or prev_day
+                    prev_sh = float(d_sh)
+                    prev_sz = float(d_sz)
+                    prev_hs = float(d_sh) + float(d_sz)
                     prev_source = "disk_cache"
 
     # Always-available non-linear session profile (no waiting for EM)
@@ -1623,8 +1657,9 @@ def _get_volume_profiles(today: str) -> dict[str, Any]:
         if len(sz_curve) < 30:
             sz_curve = dict(hs_curve)
 
-    # Hithink for previous day totals (vs_prev) — prefer when EM history missing
-    if prev_hs is None:
+    # Prefer hithink for previous complete-day HS totals (SH+SZ both required).
+    # Do not wait on EM; override incomplete/polluted EM or disk values.
+    if _hithink_api_key():
         guess = None
         try:
             d0 = datetime.strptime(today, "%Y-%m-%d")
@@ -1636,11 +1671,11 @@ def _get_volume_profiles(today: str) -> dict[str, Any]:
         except Exception:
             guess = None
         ht = _hithink_prev_day_amounts(prev_day or guess)
-        if ht.get("ok") and ht.get("prev_hs"):
+        if ht.get("ok") and ht.get("prev_sh") is not None and ht.get("prev_sz") is not None:
             prev_day = ht.get("prev_day") or prev_day or guess
             prev_sh = ht.get("prev_sh")
             prev_sz = ht.get("prev_sz")
-            prev_hs = ht.get("prev_hs")
+            prev_hs = float(prev_sh) + float(prev_sz)
             prev_source = "hithink"
 
     payload: dict[str, Any] = {

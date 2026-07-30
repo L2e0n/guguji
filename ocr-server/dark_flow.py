@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """暗盘 / 明盘资金（同花顺问财 OpenAPI / hithink-market-query）。
 
 API: POST https://openapi.iwencai.com/v1/query2data
@@ -18,6 +18,8 @@ from typing import Any, Optional
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
+import fund_structure
+
 log = logging.getLogger("dark-flow")
 
 API_URL = "https://openapi.iwencai.com/v1/query2data"
@@ -34,8 +36,9 @@ SORT_QUERIES = {
     "light_out": "主力暗盘资金,主力明盘资金,DDX,DDY,DDZ,主力增仓占比,最新价,涨跌幅 按主力资金流向从小到大排序",
 }
 
-_cache: dict[str, tuple[float, dict]] = {}
+_cache: dict[str, tuple[float, float, dict]] = {}
 CACHE_TTL = 45.0
+CACHE_STALE = 600.0  # 10 min last-good on 问财 failure
 
 
 def _now_asof() -> str:
@@ -237,43 +240,65 @@ def rank(sort: str = "dark_in", limit: int = 30, page: int = 1, refresh: bool = 
     page = max(1, min(int(page or 1), 20))
     cache_key = f"rank:{sort}:{page}:{limit}"
     now = time.time()
+
+    def _unpack(hit):
+        if len(hit) == 3:
+            return hit[0], hit[1], hit[2]
+        stored_at, payload = hit
+        return stored_at + CACHE_TTL, stored_at + CACHE_STALE, payload
+
     if not refresh and cache_key in _cache:
-        ts, cached = _cache[cache_key]
-        if now - ts < CACHE_TTL:
+        exp, _stale_until, cached = _unpack(_cache[cache_key])
+        if now <= exp:
             out = dict(cached)
             out["cached"] = True
+            out["stale"] = False
             return out
 
     query = SORT_QUERIES[sort]
-    raw = _query2data(query, page=page, limit=limit)
-    datas = raw.get("datas") or []
-    items = [_normalize_row(r) for r in datas if isinstance(r, dict)]
-    # extract asof date from any dated field
-    asof_day = None
-    if datas:
-        for k in datas[0].keys():
-            m = re.search(r"\[(20\d{6})\]", str(k))
-            if m:
-                d = m.group(1)
-                asof_day = f"{d[:4]}-{d[4:6]}-{d[6:]}"
-                break
+    try:
+        raw_data = _query2data(query, page=page, limit=limit)
+        datas = raw_data.get("datas") or []
+        items = [_normalize_row(r) for r in datas if isinstance(r, dict)]
+        asof_day = None
+        if datas:
+            for k in datas[0].keys():
+                m = re.search(r"\[(20\d{6})\]", str(k))
+                if m:
+                    d = m.group(1)
+                    asof_day = f"{d[:4]}-{d[4:6]}-{d[6:]}"
+                    break
 
-    result = {
-        "ok": True,
-        "sort": sort,
-        "page": page,
-        "limit": limit,
-        "count": int(raw.get("code_count") or len(items)),
-        "returned": len(items),
-        "items": items,
-        "source": "iwencai",
-        "query": query,
-        "asof": _now_asof(),
-        "asof_day": asof_day,
-        "cached": False,
-    }
-    _cache[cache_key] = (now, result)
-    return result
+        result = {
+            "ok": True,
+            "sort": sort,
+            "page": page,
+            "limit": limit,
+            "count": int(raw_data.get("code_count") or len(items)),
+            "returned": len(items),
+            "items": items,
+            "source": "iwencai",
+            "query": query,
+            "asof": _now_asof(),
+            "asof_day": asof_day,
+            "cached": False,
+            "stale": False,
+        }
+        _cache[cache_key] = (now + CACHE_TTL, now + CACHE_STALE, result)
+        return result
+    except Exception as e:
+        hit = _cache.get(cache_key)
+        if hit:
+            _exp, stale_until, cached = _unpack(hit)
+            if now <= stale_until and isinstance(cached, dict):
+                out = dict(cached)
+                out["ok"] = True
+                out["cached"] = True
+                out["stale"] = True
+                out["error"] = str(e)
+                log.warning("dark rank fallback to stale: %s", e)
+                return out
+        raise
 
 
 def query_stock(q: str) -> dict:
@@ -305,12 +330,24 @@ def query_stock(q: str) -> dict:
                 asof_day = f"{d[:4]}-{d[4:6]}-{d[6:]}"
                 break
 
+    profile = None
+    try:
+        code_for_profile = (best or {}).get("code") if best else None
+        if not code_for_profile:
+            code_for_profile = _code_plain(q_clean)
+        if code_for_profile:
+            profile = fund_structure.stock_fund_profile(code_for_profile, refresh=False)
+    except Exception as e:
+        log.warning("stock fund profile failed: %s", e)
+        profile = {"ok": False, "error": str(e)}
+
     return {
         "ok": True,
         "query": q,
         "item": best,
+        "profile": profile,
         "candidates": items,
-        "source": "iwencai",
+        "source": "iwencai+eastmoney",
         "asof": _now_asof(),
         "asof_day": asof_day,
     }

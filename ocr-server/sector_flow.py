@@ -7,19 +7,32 @@ order-size breakdown, leading stock, and simple capital-flow signals.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+import secrets
 import re
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Optional
 
 import requests
 
+import fund_structure
+
 log = logging.getLogger("guguji-sector-flow")
 
 TZ_SH = timezone(timedelta(hours=8))
+YI = 1e8
+VOL_PROFILE_TTL_OK = 1800.0  # successful curve cache
+VOL_PROFILE_TTL_EMPTY = 45.0  # failed/empty curve short cache
+VOL_PROFILE_DISK = Path(__file__).resolve().parent / "data" / "vol_profile_last.json"
+IWENCAI_API_URL = os.environ.get("IWENCAI_BASE_URL", "https://openapi.iwencai.com").rstrip("/") + "/v1/query2data"
+IWENCAI_SKILL_ID = "hithink-market-query"
+IWENCAI_SKILL_VERSION = "1.0.0"
 
 # Eastmoney clist board money-flow
 EM_CLIST = "https://push2.eastmoney.com/api/qt/clist/get"
@@ -59,9 +72,10 @@ MEMBER_FIELDS = (
     "f12,f14,f2,f3,f62,f184,f66,f72,f78,f84,f6,f8,f9,f20,f104"
 )
 
-# simple in-memory cache: key -> (expires_ts, payload)
-_cache: dict[str, tuple[float, Any]] = {}
+# simple in-memory cache: key -> (expires_ts, stale_until_ts, payload)
+_cache: dict[str, tuple[float, float, Any]] = {}
 _CACHE_TTL = 15.0  # seconds; boards refresh slowly enough for UI polling
+_CACHE_STALE = 300.0  # serve last-good up to 5 min on upstream failure
 
 
 def _now() -> datetime:
@@ -112,19 +126,34 @@ def _signal(chg: Optional[float], main: Optional[float]) -> dict[str, str]:
     return {"code": "flat", "label": "中性", "tone": "muted"}
 
 
-def _cache_get(key: str) -> Any:
+def _cache_get(key: str, allow_stale: bool = False) -> Any:
+    """Return fresh cache; if allow_stale, return last-good within hard stale window."""
     hit = _cache.get(key)
     if not hit:
         return None
-    exp, val = hit
-    if time.time() > exp:
+    if len(hit) == 3:
+        exp, stale_until, val = hit
+    else:
+        exp, val = hit  # type: ignore[misc]
+        stale_until = exp + _CACHE_STALE
+    now = time.time()
+    if now <= exp:
+        return val
+    if allow_stale and now <= stale_until:
+        return val
+    if now > stale_until:
         _cache.pop(key, None)
-        return None
-    return val
+    return None
 
 
-def _cache_set(key: str, val: Any, ttl: float = _CACHE_TTL) -> None:
-    _cache[key] = (time.time() + ttl, val)
+def _cache_set(key: str, val: Any, ttl: float = _CACHE_TTL, stale: float | None = None) -> None:
+    now = time.time()
+    stale_span = _CACHE_STALE if stale is None else stale
+    _cache[key] = (now + ttl, now + max(ttl, stale_span), val)
+
+
+def _cache_stale_payload(key: str) -> Any:
+    return _cache_get(key, allow_stale=True)
 
 
 def _em_get(params: dict[str, Any], timeout: float = 12.0) -> dict:
@@ -164,6 +193,17 @@ def _normalize_board(row: dict, board_type: str, period: str) -> dict:
     large_net = _num(row.get("f72"))
     mid_net = _num(row.get("f78"))
     small_net = _num(row.get("f84"))
+    # 结构资金（今日分档代理；5日/10日榜仍附带今日结构）
+    if super_net is None and large_net is None:
+        force_net = _num(row.get("f62"))
+    else:
+        force_net = (super_net or 0.0) + (large_net or 0.0)
+    retail_net = small_net
+    scissors = None
+    if force_net is not None and retail_net is not None:
+        scissors = force_net - retail_net
+    abs_sum = abs(super_net or 0) + abs(large_net or 0) + abs(mid_net or 0) + abs(small_net or 0)
+    size_main_share = round((abs(super_net or 0) + abs(large_net or 0)) / abs_sum * 100, 2) if abs_sum > 0 else None
     sig = _signal(chg, main if period == "1" else _num(row.get("f62")))
 
     return {
@@ -196,6 +236,13 @@ def _normalize_board(row: dict, board_type: str, period: str) -> dict:
         "small_net": small_net,
         "small_net_yi": _yi(small_net),
         "small_ratio": _num(row.get("f87")),
+        "force_net": force_net,
+        "force_net_yi": _yi(force_net),
+        "retail_net": retail_net,
+        "retail_net_yi": _yi(retail_net),
+        "scissors": scissors,
+        "scissors_yi": _yi(scissors),
+        "size_main_share_pct": size_main_share,
         "up_count": int(_num(row.get("f104")) or 0),
         "down_count": int(_num(row.get("f105")) or 0),
         "flat_count": int(_num(row.get("f106")) or 0),
@@ -412,35 +459,53 @@ def dual_rank(
 ) -> dict[str, Any]:
     """Convenience: top inflow + top outflow in one response."""
     top = max(1, min(int(top), 50))
-    inflow = fetch_board_flow(
-        board_type=board_type,
-        period=period,
-        sort="in",
-        limit=top,
-        primary_only=primary_only,
-        refresh=refresh,
-    )
-    outflow = fetch_board_flow(
-        board_type=board_type,
-        period=period,
-        sort="out",
-        limit=top,
-        primary_only=primary_only,
-        refresh=False,  # same underlying pull likely cached
-    )
-    return {
-        "ok": True,
-        "source": "eastmoney",
-        "board_type": board_type,
-        "period": period,
-        "asof": _now_iso(),
-        "inflow": inflow.get("items") or [],
-        "outflow": outflow.get("items") or [],
-        "summary": {
-            "inflow": inflow.get("summary"),
-            "outflow": outflow.get("summary"),
-        },
-    }
+    dual_key = f"dual:{board_type}:{period}:{top}:{primary_only}"
+    try:
+        inflow = fetch_board_flow(
+            board_type=board_type,
+            period=period,
+            sort="in",
+            limit=top,
+            primary_only=primary_only,
+            refresh=refresh,
+        )
+        outflow = fetch_board_flow(
+            board_type=board_type,
+            period=period,
+            sort="out",
+            limit=top,
+            primary_only=primary_only,
+            refresh=False,  # same underlying pull likely cached
+        )
+        result = {
+            "ok": True,
+            "source": "eastmoney",
+            "board_type": board_type,
+            "period": period,
+            "asof": _now_iso(),
+            "inflow": inflow.get("items") or [],
+            "outflow": outflow.get("items") or [],
+            "summary": {
+                "inflow": inflow.get("summary"),
+                "outflow": outflow.get("summary"),
+            },
+            "stale": False,
+            "cached": False,
+        }
+        _cache_set(dual_key, result, ttl=_CACHE_TTL, stale=_CACHE_STALE)
+        return result
+    except Exception as e:
+        stale = _cache_stale_payload(dual_key)
+        if stale and isinstance(stale, dict) and stale.get("inflow") is not None:
+            out = dict(stale)
+            out["ok"] = True
+            out["stale"] = True
+            out["cached"] = True
+            out["error"] = str(e)
+            out["asof"] = out.get("asof") or _now_iso()
+            log.warning("dual_rank fallback to stale: %s", e)
+            return out
+        raise
 
 
 def health() -> dict[str, Any]:
@@ -701,14 +766,36 @@ def _pull_wide_boards(
 
 
 def _pick_trend_boards(items: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
-    def score(it: dict) -> float:
+    def net_val(it: dict):
         v = it.get("today_main_net_yi")
         if v is None:
             v = it.get("main_net_yi")
         try:
-            return abs(float(v))
+            return float(v)
         except (TypeError, ValueError):
-            return -1.0
+            return None
+
+    # 10板：流入 TOP5 + 流出 TOP5（其余 limit 仍按绝对值最大）
+    if int(limit) == 10:
+        scored = [(it, net_val(it)) for it in items]
+        scored = [(it, v) for it, v in scored if v is not None]
+        inflows = sorted([x for x in scored if x[1] > 0], key=lambda x: x[1], reverse=True)[:5]
+        outflows = sorted([x for x in scored if x[1] < 0], key=lambda x: x[1])[:5]
+        picked = [x[0] for x in inflows] + [x[0] for x in outflows]
+        if len(picked) < 10:
+            used = {id(x) for x in picked}
+            for it, _ in sorted(scored, key=lambda x: abs(x[1]), reverse=True):
+                if id(it) in used:
+                    continue
+                picked.append(it)
+                used.add(id(it))
+                if len(picked) >= 10:
+                    break
+        return picked
+
+    def score(it: dict) -> float:
+        v = net_val(it)
+        return abs(v) if v is not None else -1.0
 
     ranked = sorted(items, key=score, reverse=True)
     # drop null main
@@ -738,8 +825,43 @@ def intraday_trend(
     if not refresh:
         cached = _cache_get(cache_key)
         if cached is not None:
+            if isinstance(cached, dict):
+                out = dict(cached)
+                out["cached"] = True
+                out["stale"] = False
+                return out
             return cached
 
+    try:
+        return _intraday_trend_fresh(
+            board_type=board_type,
+            limit=limit,
+            primary_only=primary_only,
+            klt=klt,
+            refresh=refresh,
+            cache_key=cache_key,
+        )
+    except Exception as e:
+        stale = _cache_stale_payload(cache_key)
+        if stale and isinstance(stale, dict):
+            out = dict(stale)
+            out["ok"] = True
+            out["stale"] = True
+            out["cached"] = True
+            out["error"] = str(e)
+            log.warning("intraday_trend fallback to stale: %s", e)
+            return out
+        raise
+
+
+def _intraday_trend_fresh(
+    board_type: str,
+    limit: int,
+    primary_only: bool,
+    klt: int,
+    refresh: bool,
+    cache_key: str,
+) -> dict[str, Any]:
     items = _pull_wide_boards(
         board_type=board_type,
         period="1",
@@ -925,6 +1047,7 @@ def _session_progress(now: Optional[datetime] = None) -> dict[str, Any]:
 
 
 def _predict_full_day_linear(amount: Optional[float], progress: float) -> Optional[float]:
+    """Deprecated: kept only for reference/tests; market overview no longer uses linear fallback."""
     if amount is None:
         return None
     if progress <= 0.01:
@@ -935,26 +1058,24 @@ def _predict_full_day_linear(amount: Optional[float], progress: float) -> Option
     return float(amount) / p
 
 
-# backward-compatible alias
+# backward-compatible alias (no longer used by market overview)
 def _predict_full_day(amount: Optional[float], progress: float) -> Optional[float]:
     return _predict_full_day_linear(amount, progress)
 
 
-def _predict_confidence(progress: float, method: str = "linear") -> str:
-    """Profile method is more trustworthy earlier in the session."""
-    if method == "profile":
-        if progress >= 0.55:
-            return "high"
-        if progress >= 0.20:
-            return "medium"
-        if progress >= 0.08:
-            return "low"
+def _predict_confidence(progress: float, method: str = "profile") -> str:
+    """Profile method confidence by session progress. unavailable always very_low."""
+    m = (method or "").lower()
+    if m in ("none", "unavailable", ""):
         return "very_low"
-    if progress >= 0.75:
+    if m == "closed":
         return "high"
-    if progress >= 0.35:
+    # profile / profile_cache / hithink-assisted
+    if progress >= 0.55:
+        return "high"
+    if progress >= 0.20:
         return "medium"
-    if progress >= 0.12:
+    if progress >= 0.08:
         return "low"
     return "very_low"
 
@@ -1002,8 +1123,8 @@ def _parse_trends_amounts(trends: list) -> dict[str, list[tuple[str, float]]]:
     return by_day
 
 
-def _fetch_index_trends(secid: str, ndays: int = 5) -> list:
-    """Multi-day 1-min trends from Eastmoney his (includes amount)."""
+def _fetch_index_trends(secid: str, ndays: int = 5, retries: int = 3) -> list:
+    """Multi-day 1-min trends from Eastmoney his (includes amount). Retries + dual hosts."""
     session = requests.Session()
     session.trust_env = False
     headers = {
@@ -1014,6 +1135,7 @@ def _fetch_index_trends(secid: str, ndays: int = 5) -> list:
         ),
         "Referer": "https://quote.eastmoney.com/",
         "Accept": "*/*",
+        "Connection": "close",
     }
     params = {
         "fields1": "f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13",
@@ -1027,21 +1149,27 @@ def _fetch_index_trends(secid: str, ndays: int = 5) -> list:
     hosts = [
         "https://push2his.eastmoney.com/api/qt/stock/trends2/get",
         "https://push2.eastmoney.com/api/qt/stock/trends2/get",
+        "https://push2delay.eastmoney.com/api/qt/stock/trends2/get",
     ]
     last_err: Exception | None = None
-    for url in hosts:
-        try:
-            r = session.get(url, params=params, headers=headers, timeout=12)
-            r.raise_for_status()
-            data = r.json()
-            trends = ((data.get("data") or {}).get("trends")) or []
-            if trends:
-                return trends
-        except Exception as e:
-            last_err = e
-            continue
+    for attempt in range(max(1, int(retries))):
+        params["_"] = int(time.time() * 1000)
+        for url in hosts:
+            try:
+                r = session.get(url, params=params, headers=headers, timeout=12)
+                r.raise_for_status()
+                data = r.json()
+                trends = ((data.get("data") or {}).get("trends")) or []
+                if trends:
+                    if attempt > 0:
+                        log.info("index trends %s recovered via %s attempt=%s", secid, url, attempt + 1)
+                    return trends
+            except Exception as e:
+                last_err = e
+                continue
+        time.sleep(0.35 * (attempt + 1))
     if last_err:
-        log.warning("index trends %s failed: %s", secid, last_err)
+        log.warning("index trends %s failed after retries: %s", secid, last_err)
     return []
 
 
@@ -1053,18 +1181,18 @@ def _avg_cum_ratio_curve(
     for day, pts in by_day.items():
         if day == exclude_day:
             continue
-        if len(pts) < 200:  # incomplete day, skip
+        if len(pts) < 200:
             continue
         total = sum(a for _, a in pts)
         if total <= 0:
             continue
         cum = 0.0
         day_ratio: dict[int, float] = {}
-        for tm, amt in pts:
+        for tm, a in pts:
             idx = _hhmm_to_session_idx(tm)
             if idx is None:
                 continue
-            cum += amt
+            cum += a
             day_ratio[idx] = cum / total
         if not day_ratio:
             continue
@@ -1103,7 +1231,7 @@ def _predict_by_profile(
     curve: dict[int, float],
     progress: float,
 ) -> tuple[Optional[float], str, Optional[float]]:
-    """Return (predict_amount, method, ratio_used)."""
+    """Return (predict_amount, method, ratio_used). No linear fallback."""
     if amount is None:
         return None, "none", None
     if progress >= 0.995:
@@ -1112,8 +1240,7 @@ def _predict_by_profile(
     if ratio is not None and ratio >= 0.06:
         ratio = max(0.06, min(0.995, float(ratio)))
         return float(amount) / ratio, "profile", ratio
-    pred = _predict_full_day_linear(amount, progress)
-    return pred, "linear", progress if progress > 0 else None
+    return None, "unavailable", None
 
 
 def _blend_curves(*curves: dict[int, float]) -> dict[int, float]:
@@ -1142,28 +1269,264 @@ def _complete_day_totals(
     return rows
 
 
+def _curve_to_str_keys(curve: dict[int, float]) -> dict[str, float]:
+    return {str(k): float(v) for k, v in curve.items()}
+
+
+def _curve_from_str_keys(raw: Any) -> dict[int, float]:
+    out: dict[int, float] = {}
+    if not isinstance(raw, dict):
+        return out
+    for k, v in raw.items():
+        try:
+            out[int(k)] = float(v)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _save_disk_profile(payload: dict[str, Any]) -> None:
+    try:
+        VOL_PROFILE_DISK.parent.mkdir(parents=True, exist_ok=True)
+        disk = {
+            "saved_at": _now_iso(),
+            "prev_day": payload.get("prev_day"),
+            "prev_sh": payload.get("prev_sh"),
+            "prev_sz": payload.get("prev_sz"),
+            "prev_hs": payload.get("prev_hs"),
+            "sh": _curve_to_str_keys(payload.get("sh") or {}),
+            "sz": _curve_to_str_keys(payload.get("sz") or {}),
+            "hs": _curve_to_str_keys(payload.get("hs") or {}),
+        }
+        VOL_PROFILE_DISK.write_text(json.dumps(disk, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        log.warning("save vol profile disk failed: %s", e)
+
+
+def _load_disk_profile() -> Optional[dict[str, Any]]:
+    try:
+        if not VOL_PROFILE_DISK.exists():
+            return None
+        raw = json.loads(VOL_PROFILE_DISK.read_text(encoding="utf-8"))
+        sh = _curve_from_str_keys(raw.get("sh"))
+        sz = _curve_from_str_keys(raw.get("sz"))
+        hs = _curve_from_str_keys(raw.get("hs")) or _blend_curves(sh, sz)
+        if len(hs) < 30:
+            return None
+        return {
+            "sh": sh,
+            "sz": sz,
+            "hs": hs,
+            "prev_day": raw.get("prev_day"),
+            "prev_sh": raw.get("prev_sh"),
+            "prev_sz": raw.get("prev_sz"),
+            "prev_hs": raw.get("prev_hs"),
+            "profile_source": "disk_cache",
+            "saved_at": raw.get("saved_at"),
+        }
+    except Exception as e:
+        log.warning("load vol profile disk failed: %s", e)
+        return None
+
+
+def _hithink_api_key() -> str:
+    return (os.environ.get("IWENCAI_API_KEY") or "").strip()
+
+
+def _hithink_query(query: str, limit: int = 10, timeout: int = 30) -> dict[str, Any]:
+    key = _hithink_api_key()
+    if not key:
+        raise RuntimeError("IWENCAI_API_KEY 未配置")
+    payload = {
+        "query": query,
+        "page": "1",
+        "limit": str(limit),
+        "is_cache": "1",
+        "expand_index": "true",
+    }
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+        "X-Claw-Call-Type": "normal",
+        "X-Claw-Skill-Id": IWENCAI_SKILL_ID,
+        "X-Claw-Skill-Version": IWENCAI_SKILL_VERSION,
+        "X-Claw-Plugin-Id": "none",
+        "X-Claw-Plugin-Version": "none",
+        "X-Claw-Trace-Id": secrets.token_hex(32),
+    }
+    r = requests.post(
+        IWENCAI_API_URL,
+        headers=headers,
+        json=payload,
+        timeout=timeout,
+    )
+    r.raise_for_status()
+    data = r.json()
+    if not isinstance(data, dict):
+        raise RuntimeError("hithink response not dict")
+    return data
+
+
+def _hithink_pick(row: dict, *names: str) -> Any:
+    if not row:
+        return None
+    for n in names:
+        if n in row and row[n] not in (None, ""):
+            return row[n]
+    for n in names:
+        for k, v in row.items():
+            ks = str(k)
+            if ks == n or ks.startswith(n + "[") or ks.startswith(n + ":"):
+                if v not in (None, ""):
+                    return v
+    low = [n.lower() for n in names]
+    for k, v in row.items():
+        kl = str(k).lower()
+        for n in low:
+            if n in kl and v not in (None, ""):
+                return v
+    return None
+
+
+def _hithink_float(v: Any) -> Optional[float]:
+    if v is None or v == "":
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    s = str(v).strip().replace(",", "").replace("亿", "")
+    if not s or s.lower() in ("nan", "none", "--", "-"):
+        return None
+    try:
+        # if original had 亿 unit text and was stripped, caller must not double-scale;
+        # iwencai amount fields are usually in yuan as plain numbers.
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _hithink_index_amounts() -> dict[str, Any]:
+    """Backup index amounts via 问财/hithink. Returns yuan amounts."""
+    cache_key = "hithink_index_amounts"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+    if not _hithink_api_key():
+        return {"ok": False, "error": "no_api_key"}
+    try:
+        data = _hithink_query("上证指数,深证成指,北证50 成交额 涨跌幅", limit=10, timeout=28)
+        rows = data.get("datas") or []
+        out: dict[str, Any] = {
+            "ok": True,
+            "source": "hithink",
+            "sh": None,
+            "sz": None,
+            "bj": None,
+            "raw_count": len(rows),
+        }
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            code = str(_hithink_pick(row, "指数代码", "code") or "")
+            name = str(_hithink_pick(row, "指数简称", "name") or "")
+            amt = _hithink_float(_hithink_pick(row, "成交额", "amount"))
+            chg = _hithink_float(_hithink_pick(row, "涨跌幅", "最新涨跌幅", "change"))
+            price = _hithink_float(_hithink_pick(row, "最新价", "price"))
+            item = {"amount": amt, "change_pct": chg, "price": price, "name": name, "code": code}
+            code_u = code.upper()
+            if "000001" in code_u or "上证" in name:
+                out["sh"] = item
+            elif "399001" in code_u or "深证" in name:
+                out["sz"] = item
+            elif "899050" in code_u or "北证" in name:
+                out["bj"] = item
+        _cache_set(cache_key, out, ttl=40.0, stale=300.0)
+        return out
+    except Exception as e:
+        log.warning("hithink index amounts failed: %s", e)
+        stale = _cache_stale_payload(cache_key)
+        if stale:
+            return stale
+        return {"ok": False, "error": str(e)}
+
+
+def _hithink_prev_day_amounts(prev_day: Optional[str]) -> dict[str, Any]:
+    """Try fetch previous complete-day index amounts from hithink (yuan)."""
+    if not prev_day or not _hithink_api_key():
+        return {"ok": False}
+    cache_key = f"hithink_prev:{prev_day}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+    # 问财 date-tagged fields: 成交额[YYYYMMDD]
+    dcompact = prev_day.replace("-", "")
+    try:
+        q = f"上证指数,深证成指 成交额[{dcompact}]"
+        data = _hithink_query(q, limit=10, timeout=28)
+        rows = data.get("datas") or []
+        sh = sz = None
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            code = str(_hithink_pick(row, "指数代码", "code") or "")
+            name = str(_hithink_pick(row, "指数简称", "name") or "")
+            amt = _hithink_float(_hithink_pick(row, "成交额", "amount"))
+            if amt is None:
+                continue
+            if "000001" in code.upper() or "上证" in name:
+                sh = float(amt)
+            elif "399001" in code.upper() or "深证" in name:
+                sz = float(amt)
+        out = {
+            "ok": bool(sh or sz),
+            "source": "hithink",
+            "prev_day": prev_day,
+            "prev_sh": sh,
+            "prev_sz": sz,
+            "prev_hs": (float(sh or 0) + float(sz or 0)) if (sh or sz) else None,
+        }
+        _cache_set(cache_key, out, ttl=3600.0, stale=7200.0)
+        return out
+    except Exception as e:
+        log.warning("hithink prev day amounts failed: %s", e)
+        return {"ok": False, "error": str(e)}
+
+
 def _get_volume_profiles(today: str) -> dict[str, Any]:
-    """Cached SH/SZ/HS ratio curves + previous complete-day totals."""
+    """Cached SH/SZ/HS ratio curves + previous complete-day totals.
+
+    Primary: Eastmoney trends2 (with retries).
+    Backup curve: last-good disk profile.
+    Backup prev totals / validation: hithink (问财) when configured.
+    Empty results only short-cached so recovery is fast.
+    """
     cache_key = f"vol_profile:{today}"
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
+
     sh_curve: dict[int, float] = {}
     sz_curve: dict[int, float] = {}
     sh_by: dict[str, list[tuple[str, float]]] = {}
     sz_by: dict[str, list[tuple[str, float]]] = {}
+    profile_source = "none"
+    em_error = None
+
     try:
-        sh_by = _parse_trends_amounts(_fetch_index_trends("1.000001", ndays=5))
-        sz_by = _parse_trends_amounts(_fetch_index_trends("0.399001", ndays=5))
+        # parallel-ish sequential with retries inside fetch
+        sh_by = _parse_trends_amounts(_fetch_index_trends("1.000001", ndays=5, retries=3))
+        sz_by = _parse_trends_amounts(_fetch_index_trends("0.399001", ndays=5, retries=3))
         sh_curve = _avg_cum_ratio_curve(sh_by, exclude_day=today)
         sz_curve = _avg_cum_ratio_curve(sz_by, exclude_day=today)
+        if sh_curve or sz_curve:
+            profile_source = "eastmoney"
     except Exception as e:
+        em_error = str(e)
         log.warning("volume profile build failed: %s", e)
+
     hs_curve = _blend_curves(sh_curve, sz_curve)
 
     sh_days = _complete_day_totals(sh_by, exclude_day=today)
     sz_days = _complete_day_totals(sz_by, exclude_day=today)
-    # align previous trading day: prefer intersection of days present on both
     sh_map = {d: a for d, a in sh_days}
     sz_map = {d: a for d, a in sz_days}
     common = sorted(set(sh_map) & set(sz_map), reverse=True)
@@ -1173,7 +1536,46 @@ def _get_volume_profiles(today: str) -> dict[str, Any]:
     prev_hs = None
     if prev_sh is not None or prev_sz is not None:
         prev_hs = float(prev_sh or 0.0) + float(prev_sz or 0.0)
+    prev_source = "eastmoney" if prev_hs else "none"
 
+    # Backup curve from disk last-good if EM empty
+    if len(hs_curve) < 30:
+        disk = _load_disk_profile()
+        if disk and len(disk.get("hs") or {}) >= 30:
+            sh_curve = disk.get("sh") or sh_curve
+            sz_curve = disk.get("sz") or sz_curve
+            hs_curve = disk.get("hs") or hs_curve
+            profile_source = "disk_cache"
+            if prev_hs is None:
+                prev_day = disk.get("prev_day") or prev_day
+                prev_sh = disk.get("prev_sh") if disk.get("prev_sh") is not None else prev_sh
+                prev_sz = disk.get("prev_sz") if disk.get("prev_sz") is not None else prev_sz
+                prev_hs = disk.get("prev_hs") if disk.get("prev_hs") is not None else prev_hs
+                if prev_hs is not None:
+                    prev_source = "disk_cache"
+
+    # Hithink backup for previous day totals (vs_prev)
+    if prev_hs is None:
+        # guess prev trading day from calendar (simple: yesterday, skip weekends lightly)
+        guess = None
+        try:
+            d0 = datetime.strptime(today, "%Y-%m-%d")
+            for i in range(1, 8):
+                d1 = d0 - timedelta(days=i)
+                if d1.weekday() < 5:
+                    guess = d1.strftime("%Y-%m-%d")
+                    break
+        except Exception:
+            guess = None
+        ht = _hithink_prev_day_amounts(prev_day or guess)
+        if ht.get("ok") and ht.get("prev_hs"):
+            prev_day = ht.get("prev_day") or prev_day or guess
+            prev_sh = ht.get("prev_sh")
+            prev_sz = ht.get("prev_sz")
+            prev_hs = ht.get("prev_hs")
+            prev_source = "hithink"
+
+    # If still no prev_day label but have amounts from disk/em, keep as-is
     payload: dict[str, Any] = {
         "sh": sh_curve,
         "sz": sz_curve,
@@ -1182,9 +1584,18 @@ def _get_volume_profiles(today: str) -> dict[str, Any]:
         "prev_sh": prev_sh,
         "prev_sz": prev_sz,
         "prev_hs": prev_hs,
+        "profile_source": profile_source,
+        "prev_source": prev_source,
+        "em_error": em_error,
+        "curve_points": len(hs_curve),
     }
-    # historical profiles are stable intraday
-    _cache_set(cache_key, payload, ttl=1800.0)
+
+    ok_curve = len(hs_curve) >= 30
+    if ok_curve and profile_source == "eastmoney":
+        _save_disk_profile(payload)
+
+    ttl = VOL_PROFILE_TTL_OK if ok_curve else VOL_PROFILE_TTL_EMPTY
+    _cache_set(cache_key, payload, ttl=ttl, stale=max(ttl, 300.0))
     return payload
 
 
@@ -1193,7 +1604,7 @@ def _fetch_index_quotes() -> list[dict[str, Any]]:
     session.trust_env = False
     params = {
         "fltt": "2",
-        "secids": "1.000001,0.399001,0.399006,1.000688,0.899050",
+        "secids": "1.000001,0.399001,0.399006,1.000680,1.000688,0.899050",
         "fields": "f12,f14,f2,f3,f6,f8,f104,f105,f106",
         "ut": EM_UT,
         "_": int(time.time() * 1000),
@@ -1351,9 +1762,9 @@ def _pool_stats(pool: list[dict[str, Any]]) -> dict[str, Any]:
         "st_count": len(st),
         "yizi_count": len(yizi),
         "lb2_count": len(lb2),
-        "top": _top(non_st, 8),
-        "yizi_top": _top(yizi, 6),
-        "lb2_top": _top(sorted(lb2, key=lambda z: int(z.get("lbc") or z.get("days") or 0), reverse=True), 6),
+        "top": _top(non_st, 20),
+        "yizi_top": _top(yizi, 8),
+        "lb2_top": _top(sorted(lb2, key=lambda z: int(z.get("lbc") or z.get("days") or 0), reverse=True), 8),
     }
 
 
@@ -1365,13 +1776,59 @@ def market_overview(refresh: bool = False) -> dict[str, Any]:
         if cached is not None:
             out = dict(cached)
             out["cached"] = True
+            out["stale"] = False
             return out
 
+    try:
+        return _market_overview_fresh(cache_key, refresh=refresh)
+    except Exception as e:
+        stale = _cache_stale_payload(cache_key)
+        if stale and isinstance(stale, dict):
+            out = dict(stale)
+            out["ok"] = True
+            out["stale"] = True
+            out["cached"] = True
+            out["error"] = str(e)
+            log.warning("market_overview fallback to stale: %s", e)
+            return out
+        raise
+
+
+def _market_overview_fresh(cache_key: str, refresh: bool = False) -> dict[str, Any]:
     progress = _session_progress()
     p = float(progress["progress"] or 0)
 
     quotes = _fetch_index_quotes()
     by_code = {str(x.get("f12")): x for x in quotes}
+    amount_source = "eastmoney"
+    # Hithink backup for live index amounts when EM quote amount missing
+    ht_amt = None
+    def _ensure_amount(code: str, ht_key: str) -> None:
+        nonlocal amount_source, ht_amt
+        row = by_code.get(code) or {}
+        if _num(row.get("f6")) is not None:
+            return
+        if ht_amt is None:
+            ht_amt = _hithink_index_amounts()
+        item = (ht_amt or {}).get(ht_key) or {}
+        amt = item.get("amount")
+        if amt is None:
+            return
+        # synthesize minimal EM-like row
+        if code not in by_code:
+            by_code[code] = {"f12": code, "f14": item.get("name") or code}
+        by_code[code]["f6"] = amt
+        if item.get("change_pct") is not None and by_code[code].get("f3") is None:
+            by_code[code]["f3"] = item.get("change_pct")
+        if item.get("price") is not None and by_code[code].get("f2") is None:
+            by_code[code]["f2"] = item.get("price")
+        amount_source = "hithink" if amount_source == "eastmoney" and not quotes else (
+            "mixed" if quotes else "hithink"
+        )
+    _ensure_amount("000001", "sh")
+    _ensure_amount("399001", "sz")
+    _ensure_amount("899050", "bj")
+
     now_hhmm = (progress.get("asof_time") or "09:30")[:5]
     today = progress.get("day") or _now().strftime("%Y-%m-%d")
     prof = _get_volume_profiles(today)
@@ -1405,7 +1862,8 @@ def market_overview(refresh: bool = False) -> dict[str, Any]:
     sh = _idx("000001", "上证指数", sh_curve)
     sz = _idx("399001", "深证成指", sz_curve)
     cyb = _idx("399006", "创业板指", sz_curve)
-    kc = _idx("000688", "科创50", sh_curve)
+    kc = _idx("000680", "科创综指", sh_curve)  # 科创板全市场成交额口径
+    kc50 = _idx("000688", "科创50", sh_curve)
     bj50 = _idx("899050", "北证50", hs_curve)
 
     bj_amt = _bj_market_amount()
@@ -1513,11 +1971,12 @@ def market_overview(refresh: bool = False) -> dict[str, Any]:
         "session": progress,
         "volume": {
             "unit": "yi",
-            "sh": sh,
-            "sz": sz,
+            "sh": {**sh, "board": "shanghai", "label": "上证"},
+            "sz": {**sz, "board": "shenzhen", "label": "深成指"},
             "bj": bj,
-            "cyb": cyb,
-            "kc": kc,
+            "cyb": {**cyb, "board": "chinext", "label": "创业板", "parent": "sz"},
+            "kc": {**kc, "board": "star", "label": "科创板", "parent": "sh", "index_note": "科创综指成交额≈科创板"},
+            "kc50": {**kc50, "board": "star50", "label": "科创50", "parent": "sh"},
             "hs": {
                 "name": "沪深两市",
                 "amount": hs_amt,
@@ -1536,9 +1995,12 @@ def market_overview(refresh: bool = False) -> dict[str, Any]:
                 "predict_method": total_method,
                 "profile_ratio": round(total_ratio, 4) if total_ratio is not None else None,
             },
-            "method": "实际=东财指数成交额；预测=当前额/近几日同时刻累计成交占比(量能曲线)，缺历史时回退线性外推",
-            "predict_confidence": _predict_confidence(p, method=total_method if total_method != "none" else "linear"),
+            "method": "实际=东财指数成交额(失败则问财/hithink备份)；预测=当前额/近几日同时刻累计成交占比(量能曲线)；东财曲线失败用本地last-good；无曲线则不预测(已取消线性回退)",
+            "predict_confidence": _predict_confidence(p, method=total_method if total_method not in (None, "none") else "unavailable"),
             "profile_minutes": len(hs_curve),
+            "profile_source": prof.get("profile_source") or ("eastmoney" if hs_curve else "none"),
+            "prev_source": prof.get("prev_source") or "none",
+            "amount_source": amount_source,
             "asof_hhmm": now_hhmm,
             "vs_prev": vs_prev,
         },
@@ -1559,6 +2021,7 @@ def market_overview(refresh: bool = False) -> dict[str, Any]:
             },
             "note": "涨停/跌停/炸板来自东财主题池，统计已剔除 ST 名称",
         },
+        "structure": fund_structure.market_structure(refresh=refresh),
     }
     _cache_set(cache_key, result, ttl=_MARKET_TTL)
     return result

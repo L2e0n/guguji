@@ -30,6 +30,7 @@ import qdii_service
 import qdii_radar
 import sector_flow
 import dark_flow
+import fund_structure
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("guguji-ocr")
@@ -1035,6 +1036,31 @@ def dark_query():
         return jsonify({"ok": False, "error": str(e)}), 400
     except Exception as e:
         log.warning("dark query failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+
+
+@app.route("/api/stock/fund-profile", methods=["GET"])
+def stock_fund_profile():
+    """个股资金成分：分档主力/散户、两融、龙虎榜席位标签。"""
+    q = request.args.get("q") or request.args.get("code") or ""
+    refresh = request.args.get("refresh", "").lower() in ("1", "true", "yes")
+    try:
+        return jsonify(fund_structure.stock_fund_profile(q, refresh=refresh))
+    except Exception as e:
+        log.warning("stock fund profile failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/sector/structure", methods=["GET"])
+def sector_structure():
+    """全市场结构资金（主力/散户/剪刀差/北向）。"""
+    refresh = request.args.get("refresh", "").lower() in ("1", "true", "yes")
+    try:
+        return jsonify(fund_structure.market_structure(refresh=refresh))
+    except Exception as e:
+        log.warning("sector structure failed: %s", e)
         return jsonify({"ok": False, "error": str(e)}), 500
 
 

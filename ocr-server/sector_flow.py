@@ -1012,6 +1012,19 @@ EM_QS_HOSTS = [
     "https://push2ex.eastmoney.com/getTopicQSPool",
     "https://push2exdelay.eastmoney.com/getTopicQSPool",
 ]
+EM_CX_HOSTS = [
+    "https://push2ex.eastmoney.com/getTopicCXPool",
+    "https://push2exdelay.eastmoney.com/getTopicCXPool",
+]
+# typo-tolerant alias used by some EM frontends
+EM_CX_HOSTS_ALT = [
+    "https://push2ex.eastmoney.com/getTopicCXPooll",
+    "https://push2exdelay.eastmoney.com/getTopicCXPooll",
+]
+EM_YZT_HOSTS = [
+    "https://push2ex.eastmoney.com/getYesterdayZTPool",
+    "https://push2exdelay.eastmoney.com/getYesterdayZTPool",
+]
 _MARKET_TTL = 12.0
 
 
@@ -3585,56 +3598,239 @@ def _compute_sentiment_strength(
     }
 
 
+def _board_limit_pct(code: Any, name: Any = None) -> float:
+    """Board limit-up/down percent for common A-share rules."""
+    n = str(name or "").upper().replace(" ", "")
+    if "ST" in n:
+        return 5.0
+    c = str(code or "").strip()
+    if len(c) >= 6:
+        c6 = c[-6:]
+    else:
+        c6 = c
+    if c6.startswith(("300", "301", "688", "689")):
+        return 20.0
+    # BJ / 新三板精选层风格
+    if c6.startswith(("8", "4", "9")) and not c6.startswith(("60", "00", "30")):
+        # 北交所常见 8/4 开头
+        if c6[0] in ("8", "4"):
+            return 30.0
+    return 10.0
+
+
+def _lbc_of(x: dict[str, Any]) -> int:
+    if not isinstance(x, dict):
+        return 0
+    lbc = x.get("lbc")
+    if lbc is None and isinstance(x.get("zttj"), dict):
+        lbc = x["zttj"].get("ct") or x["zttj"].get("days")
+    if lbc is None:
+        lbc = x.get("days") or x.get("ylbc")
+    try:
+        return int(lbc or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _fbt_int(x: dict[str, Any], key: str = "fbt") -> int:
+    try:
+        v = x.get(key)
+        if v is None:
+            return 999999
+        return int(v)
+    except (TypeError, ValueError):
+        return 999999
+
+
+def _zbc_int(x: dict[str, Any]) -> int:
+    try:
+        return int(x.get("zbc") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _is_yizi_row(x: dict[str, Any]) -> bool:
+    """Heuristic one-word board: first seal at/before open and never opened."""
+    return _zbc_int(x) == 0 and 0 <= _fbt_int(x) <= 93000
+
+
+def _as_pool_row(
+    code: Any,
+    name: Any,
+    *,
+    zdp: Any = None,
+    amount: Any = None,
+    lbc: Any = None,
+    fbt: Any = None,
+    zbc: Any = None,
+    hybk: Any = None,
+    fund: Any = None,
+    extra: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    row: dict[str, Any] = {
+        "c": str(code or "").strip(),
+        "n": str(name or "").strip(),
+        "zdp": zdp,
+        "amount": amount,
+        "lbc": lbc,
+        "fbt": fbt,
+        "zbc": zbc,
+        "hybk": hybk,
+        "fund": fund,
+    }
+    if extra:
+        row.update(extra)
+    return row
+
+
+def _em_clist_scan(
+    *,
+    pagesize: int = 200,
+    sort: str = "f3:desc",
+    fs: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    """Scan Eastmoney clist for A-share quotes used by near-limit / once-down rules."""
+    session = requests.Session()
+    session.trust_env = False
+    # 沪深 A 股（不含北交，控制噪音；北交在主题池里仍可出现）
+    fs = fs or "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
+    fields = "f2,f3,f6,f8,f12,f14,f15,f16,f17,f18,f22,f100"
+    fid = (sort.split(":")[0] if sort else "f3")
+    po = 1
+    if sort and sort.endswith(":asc"):
+        po = 0
+    params = {
+        "pn": 1,
+        "pz": int(pagesize),
+        "po": int(po),
+        "np": 1,
+        "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+        "fltt": 2,
+        "invt": 2,
+        "fid": fid,
+        "fs": fs,
+        "fields": fields,
+        "_": int(time.time() * 1000),
+    }
+    # order via fid + po already; keep sort string only for logging
+    hosts = [
+        EM_CLIST,
+        "https://push2delay.eastmoney.com/api/qt/clist/get",
+        "https://82.push2.eastmoney.com/api/qt/clist/get",
+    ]
+    for url in hosts:
+        try:
+            r = session.get(url, params=params, headers=EM_HEADERS, timeout=10)
+            r.raise_for_status()
+            data = r.json()
+            diff = ((data.get("data") or {}).get("diff")) or []
+            if isinstance(diff, list) and diff:
+                return [x for x in diff if isinstance(x, dict)]
+        except Exception as e:
+            log.warning("clist scan failed %s: %s", url, e)
+            continue
+    return []
+
+
 def _pool_item_to_daban(x: dict[str, Any], tab: str) -> Optional[dict[str, Any]]:
     if not isinstance(x, dict):
         return None
-    code = str(x.get("c") or "").strip()
-    name = str(x.get("n") or "").strip()
+    code = str(x.get("c") or x.get("f12") or "").strip()
+    name = str(x.get("n") or x.get("f14") or "").strip()
     if not code or not name:
         return None
     if _is_st_name(name):
         return None
-    lbc = x.get("lbc")
-    if lbc is None and isinstance(x.get("zttj"), dict):
-        lbc = x["zttj"].get("ct") or x["zttj"].get("days")
-    try:
-        limit_times = int(lbc) if lbc is not None else None
-    except (TypeError, ValueError):
-        limit_times = None
+
+    limit_times = _lbc_of(x)
     board_text = None
-    if limit_times and limit_times >= 2:
-        board_text = f"{limit_times}板"
-    elif tab == "broken":
+    if tab == "broken":
         board_text = "炸板"
+        zbc = _zbc_int(x)
+        if zbc > 0:
+            board_text = f"炸{zbc}次"
     elif tab == "auction":
-        board_text = "早封"
+        fbt = _fbt_int(x)
+        if fbt <= 92530:
+            board_text = "竞价封"
+        elif fbt <= 93030:
+            board_text = "开盘封"
+        else:
+            board_text = "早封"
     elif tab == "near_limit":
-        board_text = "强势"
-    hybk = str(x.get("hybk") or "").strip() or None
-    chg = _num(x.get("zdp"))
+        board_text = str(x.get("near_tag") or "逼近")
+    elif tab == "wind":
+        if limit_times >= 2:
+            board_text = f"{limit_times}板"
+        else:
+            board_text = str(x.get("wind_tag") or "风向")
+    elif tab == "limit_down":
+        days = limit_times or 1
+        board_text = f"跌停{days}天" if days > 1 else "跌停"
+    elif tab == "new_stock":
+        ods = x.get("ods")
+        try:
+            ods_i = int(ods) if ods is not None else None
+        except (TypeError, ValueError):
+            ods_i = None
+        if name.startswith("N") or name.startswith("C"):
+            board_text = "新股"
+        elif ods_i is not None:
+            board_text = f"次新{ods_i}日"
+        else:
+            board_text = "次新"
+    elif tab == "natural":
+        board_text = "自然涨停"
+        if limit_times >= 2:
+            board_text = f"自然{limit_times}板"
+    elif tab == "once_down":
+        board_text = str(x.get("once_tag") or "曾跌停")
+    elif limit_times and limit_times >= 2:
+        board_text = f"{limit_times}板"
+    elif tab == "limit_up":
+        board_text = "首板" if limit_times <= 1 else f"{limit_times}板"
+
+    hybk = str(x.get("hybk") or x.get("f100") or "").strip() or None
+    chg = _num(x.get("zdp") if x.get("zdp") is not None else x.get("f3"))
     # 涨停池涨跌幅接近 0 不展示
     if tab == "limit_up" and chg is not None and abs(float(chg)) < 1e-6:
         chg = None
+    amount = x.get("amount") if x.get("amount") is not None else x.get("f6")
     return {
         "code": code,
         "name": name,
         "change_pct": chg,
         "board_text": board_text,
-        "limit_times": limit_times,
+        "limit_times": limit_times or None,
         "theme": hybk,
         "industry": hybk,
         "tab": tab,
-        "amount_yi": _yi(_num(x.get("amount"))),
+        "amount_yi": _yi(_num(amount)),
         "fbt": x.get("fbt"),
         "zbc": x.get("zbc"),
+        "fund": _num(x.get("fund")),
+        "score": _num(x.get("_score")),
+        "rule": x.get("_rule"),
     }
 
 
 def _fbt_sort_key(x: dict[str, Any]) -> int:
-    try:
-        return int(x.get("fbt") if x.get("fbt") is not None else 999999)
-    except (TypeError, ValueError):
-        return 999999
+    return _fbt_int(x)
+
+
+def _fund_of(x: dict[str, Any]) -> float:
+    v = _num(x.get("fund"))
+    return float(v) if v is not None else 0.0
+
+
+def _amount_of(x: dict[str, Any]) -> float:
+    v = _num(x.get("amount") if x.get("amount") is not None else x.get("f6"))
+    return float(v) if v is not None else 0.0
+
+
+def _zdp_of(x: dict[str, Any]) -> float:
+    v = _num(x.get("zdp") if x.get("zdp") is not None else x.get("f3"))
+    return float(v) if v is not None else -999.0
 
 
 def _build_daban_from_em(
@@ -3642,76 +3838,411 @@ def _build_daban_from_em(
     zb_pool: list[dict[str, Any]],
     qs_pool: list[dict[str, Any]],
     *,
+    dt_pool: Optional[list[dict[str, Any]]] = None,
+    cx_pool: Optional[list[dict[str, Any]]] = None,
+    yzt_pool: Optional[list[dict[str, Any]]] = None,
+    clist_up: Optional[list[dict[str, Any]]] = None,
+    clist_speed: Optional[list[dict[str, Any]]] = None,
+    clist_down: Optional[list[dict[str, Any]]] = None,
     limit: int = 15,
     day: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Build daban tabs from Eastmoney topic pools (no third-party board APIs)."""
+    """Build short-term board tabs from Eastmoney public pools + clist rules (v2).
+
+    Rules aim to mirror common short-term watchlists (auction / near-limit / wind /
+    natural first-board / once limit-down) without third-party proprietary feeds.
+    """
     lim = max(5, min(int(limit or 15), 40))
     non_st_zt = [x for x in (zt_pool or []) if not _is_st_name(x.get("n") or "")]
     non_st_zb = [x for x in (zb_pool or []) if not _is_st_name(x.get("n") or "")]
     non_st_qs = [x for x in (qs_pool or []) if not _is_st_name(x.get("n") or "")]
+    non_st_dt = [x for x in (dt_pool or []) if not _is_st_name(x.get("n") or "")]
+    non_st_cx = [x for x in (cx_pool or []) if not _is_st_name(x.get("n") or "")]
+    non_st_yzt = [x for x in (yzt_pool or []) if not _is_st_name(x.get("n") or "")]
     zt_codes = {str(x.get("c") or "") for x in non_st_zt}
+    zb_codes = {str(x.get("c") or "") for x in non_st_zb}
+    qs_codes = {str(x.get("c") or "") for x in non_st_qs}
+    dt_codes = {str(x.get("c") or "") for x in non_st_dt}
+    yzt_codes = {str(x.get("c") or "") for x in non_st_yzt}
 
-    # 竞价/早封：首封时间靠近集合竞价结束
-    auction_src = sorted(
-        [x for x in non_st_zt if _fbt_sort_key(x) <= 93030],
-        key=_fbt_sort_key,
-    )
-    if len(auction_src) < 5:
-        # 补最早封板
-        auction_src = sorted(non_st_zt, key=_fbt_sort_key)[: max(lim, 10)]
-
-    # 即将涨停：强势池中尚未在涨停池、且涨幅靠前
-    near_src = []
-    for x in sorted(non_st_qs, key=lambda z: float(_num(z.get("zdp")) or -999), reverse=True):
-        code = str(x.get("c") or "")
-        if code in zt_codes:
-            continue
-        near_src.append(x)
-        if len(near_src) >= lim:
-            break
-    if len(near_src) < 5:
-        # fallback：涨停池中炸板次数>0 或最晚封
-        near_src = sorted(
-            non_st_zt,
-            key=lambda z: float(_num(z.get("zdp")) or 0),
-            reverse=True,
-        )[:lim]
-
-    # 涨停：成交额排序
+    # ---------- 涨停：封单优先 → 连板 → 早封 → 成交额 ----------
     limit_up_src = sorted(
         non_st_zt,
-        key=lambda z: float(_num(z.get("amount")) or 0),
-        reverse=True,
-    )[:lim]
-
-    # 炸板
-    broken_src = sorted(
-        non_st_zb,
-        key=lambda z: float(_num(z.get("amount")) or 0),
-        reverse=True,
-    )[:lim]
-
-    # 风向标：连板高度优先 + 强势池高位
-    wind_src = sorted(
-        non_st_zt,
         key=lambda z: (
-            int(z.get("lbc") or (z.get("zttj") or {}).get("ct") or 0),
-            float(_num(z.get("amount")) or 0),
+            _fund_of(z),
+            _lbc_of(z),
+            -_fbt_int(z),  # earlier seal first when fund/lbc equal
+            _amount_of(z),
         ),
         reverse=True,
-    )[: max(8, lim // 2)]
-    for x in near_src:
-        if str(x.get("c") or "") not in {str(y.get("c") or "") for y in wind_src}:
-            wind_src.append(x)
-        if len(wind_src) >= lim:
-            break
+    )[:lim]
 
-    def _tab(key: str, label: str, src: list) -> dict[str, Any]:
+    # ---------- 炸板：成交额 × 早炸/多次炸加权 ----------
+    def _broken_score(z: dict[str, Any]) -> float:
+        amt = _amount_of(z)
+        zbc = max(1, _zbc_int(z))
+        fbt = _fbt_int(z)
+        early = 1.25 if fbt <= 100000 else (1.1 if fbt <= 103000 else 1.0)
+        multi = 1.0 + min(0.35, 0.08 * max(0, zbc - 1))
+        return amt * early * multi
+
+    broken_src = sorted(non_st_zb, key=_broken_score, reverse=True)[:lim]
+    for z in broken_src:
+        z["_score"] = _broken_score(z)
+        z["_rule"] = "amount*early*multi_zbc"
+
+    # ---------- 自然涨停：非一字（盘中可交易封板），首板优先 ----------
+    natural_src = []
+    for z in non_st_zt:
+        if _is_yizi_row(z):
+            continue
+        # 首板权重更高；2 板及以上也可进（非一字连板）但排序靠后
+        natural_src.append(z)
+    natural_src = sorted(
+        natural_src,
+        key=lambda z: (
+            1 if _lbc_of(z) <= 1 else 0,
+            _fund_of(z),
+            _amount_of(z),
+            -_fbt_int(z),
+        ),
+        reverse=True,
+    )[:lim]
+    for z in natural_src:
+        z["_rule"] = "non_yizi_natural"
+
+    # ---------- 跌停：封单/成交额 ----------
+    limit_down_src = sorted(
+        non_st_dt,
+        key=lambda z: (_fund_of(z), _amount_of(z), -_fbt_int(z, "lbt")),
+        reverse=True,
+    )[:lim]
+    for z in limit_down_src:
+        z["_rule"] = "dt_fund_amount"
+
+    # ---------- 新股/次新：开板天数升序，成交活跃优先 ----------
+    def _ods_of(z: dict[str, Any]) -> int:
+        try:
+            return int(z.get("ods") if z.get("ods") is not None else 9999)
+        except (TypeError, ValueError):
+            return 9999
+
+    new_stock_src = sorted(
+        non_st_cx,
+        key=lambda z: (
+            _ods_of(z),
+            -_amount_of(z),
+            -_zdp_of(z),
+        ),
+    )[:lim]
+    for z in new_stock_src:
+        z["_rule"] = "cx_ods_amount"
+
+    # ---------- 即将涨停：涨幅/涨速/距板 + 强势/炸板回封交叉 ----------
+    clist_map: dict[str, dict[str, Any]] = {}
+    for row in (clist_up or []) + (clist_speed or []) + (clist_down or []):
+        code = str(row.get("f12") or "").strip()
+        if code:
+            # prefer row that has low/open fields; later rows only fill missing
+            prev = clist_map.get(code)
+            if prev is None:
+                clist_map[code] = row
+            else:
+                merged = dict(prev)
+                for kk, vv in row.items():
+                    if merged.get(kk) is None and vv is not None:
+                        merged[kk] = vv
+                clist_map[code] = merged
+
+    near_candidates: list[dict[str, Any]] = []
+    seen_near: set[str] = set()
+
+    def _push_near(row: dict[str, Any], tag: str, score: float, rule: str) -> None:
+        code = str(row.get("c") or row.get("f12") or "").strip()
+        if not code or code in seen_near or code in zt_codes:
+            return
+        name = str(row.get("n") or row.get("f14") or "").strip()
+        if not name or _is_st_name(name):
+            return
+        item = dict(row)
+        if "c" not in item:
+            item["c"] = code
+        if "n" not in item:
+            item["n"] = name
+        if item.get("zdp") is None and row.get("f3") is not None:
+            item["zdp"] = row.get("f3")
+        if item.get("amount") is None and row.get("f6") is not None:
+            item["amount"] = row.get("f6")
+        if item.get("hybk") is None and row.get("f100") is not None:
+            item["hybk"] = row.get("f100")
+        item["near_tag"] = tag
+        item["_score"] = score
+        item["_rule"] = rule
+        near_candidates.append(item)
+        seen_near.add(code)
+
+    # clist primary: closest to limit-up with momentum
+    for row in list(clist_map.values()):
+        code = str(row.get("f12") or "").strip()
+        name = str(row.get("f14") or "").strip()
+        if not code or code in zt_codes or _is_st_name(name):
+            continue
+        px = _num(row.get("f2"))
+        prev = _num(row.get("f18"))
+        chg = _num(row.get("f3"))
+        spd = _num(row.get("f22")) or 0.0
+        if px is None or prev is None or prev <= 0:
+            continue
+        lim_pct = _board_limit_pct(code, name)
+        limit_px = prev * (1.0 + lim_pct / 100.0)
+        # already sealed / at limit
+        if px >= limit_px * 0.998:
+            continue
+        # too weak
+        if chg is None or chg < lim_pct * 0.45:
+            continue
+        gap_pct = max(0.0, (limit_px - px) / prev * 100.0)  # pct points to limit
+        # distance score: smaller gap better
+        score = float(chg) + float(spd) * 2.2 - gap_pct * 3.5
+        if code in qs_codes:
+            score += 5.0
+        if code in zb_codes:
+            score += 8.0  # 回封候选
+        if code in yzt_codes:
+            score += 2.5
+        tag = "回封" if code in zb_codes else ("强势" if code in qs_codes else "逼近")
+        _push_near(
+            _as_pool_row(
+                code,
+                name,
+                zdp=chg,
+                amount=row.get("f6"),
+                hybk=row.get("f100"),
+                extra={"f2": px, "f18": prev, "f22": spd},
+            ),
+            tag,
+            score,
+            "clist_gap_speed",
+        )
+
+    # QS not yet sealed (exclude already at/near board limit)
+    for z in non_st_qs:
+        code = str(z.get("c") or "")
+        name = str(z.get("n") or "")
+        if code in zt_codes:
+            continue
+        chg = _zdp_of(z)
+        lim_pct = _board_limit_pct(code, name)
+        if chg >= lim_pct - 0.15:
+            continue
+        score = chg + (8.0 if code in zb_codes else 0.0) + 3.0
+        _push_near(z, "强势", score, "qs_unsealed")
+
+    # ZB re-seal candidates near limit (not sealed)
+    for z in non_st_zb:
+        code = str(z.get("c") or "")
+        name = str(z.get("n") or "")
+        if code in zt_codes:
+            continue
+        chg = _zdp_of(z)
+        lim_pct = _board_limit_pct(code, name)
+        if chg < max(5.0, lim_pct * 0.55):
+            continue
+        if chg >= lim_pct - 0.12:
+            continue
+        score = chg + 10.0 + min(5.0, _zbc_int(z) * 0.8)
+        _push_near(z, "回封", score, "zb_reseal")
+
+    near_src = sorted(near_candidates, key=lambda z: float(z.get("_score") or -999), reverse=True)[:lim]
+    if len(near_src) < 5:
+        # fallback: strongest QS / late-seal ZT excluded
+        for z in sorted(non_st_qs, key=_zdp_of, reverse=True):
+            _push_near(z, "强势", _zdp_of(z), "fallback_qs")
+            if len(seen_near) >= lim:
+                break
+        near_src = sorted(near_candidates, key=lambda z: float(z.get("_score") or -999), reverse=True)[:lim]
+
+    # ---------- 竞价/早封：竞价封 ∪ 开盘秒板 ∪ 昨涨停高开 / 高开强势 ----------
+    auction_map: dict[str, dict[str, Any]] = {}
+
+    def _push_auction(z: dict[str, Any], rule: str, score: float) -> None:
+        code = str(z.get("c") or z.get("f12") or "").strip()
+        if not code:
+            return
+        name = str(z.get("n") or z.get("f14") or "").strip()
+        if not name or _is_st_name(name):
+            return
+        cur = auction_map.get(code)
+        item = dict(z)
+        if "c" not in item:
+            item["c"] = code
+        if "n" not in item:
+            item["n"] = name
+        item["_rule"] = rule
+        item["_score"] = score
+        if cur is None or score > float(cur.get("_score") or -999):
+            auction_map[code] = item
+
+    for z in non_st_zt:
+        fbt = _fbt_int(z)
+        if fbt <= 92530:
+            _push_auction(z, "auction_seal", 1000.0 - fbt / 1e6 + _fund_of(z) / 1e12)
+        elif fbt <= 93030:
+            _push_auction(z, "open_seal", 800.0 - fbt / 1e6 + _fund_of(z) / 1e12)
+
+    # 昨涨停今日表现：高开/强势优先（竞价情绪延续）
+    for z in non_st_yzt:
+        code = str(z.get("c") or "")
+        chg = _zdp_of(z)
+        # 高开或仍强
+        if chg >= 3.0:
+            row = dict(z)
+            # map yesterday fields
+            if row.get("fbt") is None:
+                row["fbt"] = z.get("yfbt")
+            if row.get("lbc") is None:
+                row["lbc"] = z.get("ylbc")
+            _push_auction(row, "prev_zt_strong", 500.0 + chg + _lbc_of(row) * 3.0)
+
+    # clist 高开（开/昨收）
+    for row in clist_map.values():
+        code = str(row.get("f12") or "").strip()
+        name = str(row.get("f14") or "").strip()
+        if not code or _is_st_name(name):
+            continue
+        op = _num(row.get("f17"))
+        prev = _num(row.get("f18"))
+        chg = _num(row.get("f3")) or 0.0
+        if op is None or prev is None or prev <= 0:
+            continue
+        open_pct = (op / prev - 1.0) * 100.0
+        if open_pct < 5.0 and not (code in yzt_codes and open_pct >= 2.0):
+            continue
+        lim_pct = _board_limit_pct(code, name)
+        # near open-limit
+        score = 300.0 + open_pct * 3.0 + (5.0 if code in yzt_codes else 0.0) + float(chg) * 0.5
+        if open_pct >= lim_pct * 0.95:
+            score += 20.0
+        _push_auction(
+            _as_pool_row(code, name, zdp=chg, amount=row.get("f6"), hybk=row.get("f100"), fbt=92500 if open_pct >= lim_pct * 0.95 else 93000),
+            "high_open",
+            score,
+        )
+
+    auction_src = sorted(auction_map.values(), key=lambda z: float(z.get("_score") or -999), reverse=True)
+    if len(auction_src) < 5:
+        # fallback earliest seals
+        extra = sorted(non_st_zt, key=_fbt_int)[: max(lim, 10)]
+        for z in extra:
+            _push_auction(z, "fallback_early_seal", 100.0 - _fbt_int(z) / 1e6)
+        auction_src = sorted(auction_map.values(), key=lambda z: float(z.get("_score") or -999), reverse=True)
+    auction_src = auction_src[:lim]
+
+    # ---------- 风向标：连板梯队 + 题材龙头 + 少量即将 ----------
+    wind_map: dict[str, dict[str, Any]] = {}
+
+    def _push_wind(z: dict[str, Any], tag: str, score: float, rule: str) -> None:
+        code = str(z.get("c") or "").strip()
+        if not code:
+            return
+        name = str(z.get("n") or "").strip()
+        if not name or _is_st_name(name):
+            return
+        item = dict(z)
+        item["wind_tag"] = tag
+        item["_score"] = score
+        item["_rule"] = rule
+        cur = wind_map.get(code)
+        if cur is None or score > float(cur.get("_score") or -999):
+            wind_map[code] = item
+
+    # 连板高度梯队
+    for z in non_st_zt:
+        lbc = _lbc_of(z)
+        score = lbc * 100.0 + _fund_of(z) / 1e8 + _amount_of(z) / 1e10
+        tag = f"{lbc}板" if lbc >= 2 else "首板龙头"
+        _push_wind(z, tag, score, "lianban_ladder")
+
+    # 题材（hybk）涨停家数龙头
+    theme_groups: dict[str, list[dict[str, Any]]] = {}
+    for z in non_st_zt:
+        th = str(z.get("hybk") or "").strip() or "其他"
+        theme_groups.setdefault(th, []).append(z)
+    for th, rows in theme_groups.items():
+        if len(rows) < 2 and _lbc_of(rows[0]) < 2:
+            continue
+        leader = sorted(
+            rows,
+            key=lambda z: (_lbc_of(z), _fund_of(z), _amount_of(z)),
+            reverse=True,
+        )[0]
+        score = 50.0 + len(rows) * 8.0 + _lbc_of(leader) * 20.0 + _fund_of(leader) / 1e9
+        _push_wind(leader, f"{th[:6]}龙头", score, "theme_leader")
+
+    # 即将高分少量进入风向
+    for z in near_src[:5]:
+        _push_wind(z, z.get("near_tag") or "发酵", 40.0 + float(z.get("_score") or 0) * 0.2, "near_seed")
+
+    wind_src = sorted(wind_map.values(), key=lambda z: float(z.get("_score") or -999), reverse=True)[:lim]
+
+    # ---------- 曾跌停：最低价触及跌停、现价已打开 ----------
+    once_src: list[dict[str, Any]] = []
+    for row in clist_map.values():
+        code = str(row.get("f12") or "").strip()
+        name = str(row.get("f14") or "").strip()
+        if not code or not name or _is_st_name(name):
+            continue
+        if code in dt_codes:
+            continue  # still limit-down -> belongs to 跌停 tab
+        px = _num(row.get("f2"))
+        low = _num(row.get("f16"))
+        prev = _num(row.get("f18"))
+        chg = _num(row.get("f3"))
+        if px is None or low is None or prev is None or prev <= 0:
+            continue
+        lim_pct = _board_limit_pct(code, name)
+        limit_dn = prev * (1.0 - lim_pct / 100.0)
+        # touched limit-down intraday
+        if low > limit_dn * 1.002:
+            continue
+        # opened / recovered
+        if px <= limit_dn * 1.003:
+            continue
+        recover = (px - low) / prev * 100.0
+        score = recover * 3.0 + (float(chg) if chg is not None else 0.0) + _amount_of({"amount": row.get("f6")}) / 1e10
+        once_src.append(
+            _as_pool_row(
+                code,
+                name,
+                zdp=chg,
+                amount=row.get("f6"),
+                hybk=row.get("f100"),
+                extra={
+                    "once_tag": "曾跌停",
+                    "_score": score,
+                    "_rule": "low_hit_limit_dn",
+                    "f16": low,
+                    "f2": px,
+                },
+            )
+        )
+    once_src = sorted(once_src, key=lambda z: float(z.get("_score") or -999), reverse=True)[:lim]
+
+    # 若 clist 空，用跌停池弱化兜底（仅展示已跌停，标记不同）
+    if not once_src and non_st_dt:
+        for z in sorted(non_st_dt, key=_amount_of, reverse=True)[: max(3, lim // 3)]:
+            item = dict(z)
+            item["once_tag"] = "跌停中"
+            item["_rule"] = "fallback_dt"
+            once_src.append(item)
+
+    def _tab(key: str, label: str, src: list, rule: str = "") -> dict[str, Any]:
         items = []
         for x in src[:lim]:
             it = _pool_item_to_daban(x, key)
             if it:
+                if rule and not it.get("rule"):
+                    it["rule"] = rule
                 items.append(it)
         return {
             "ok": bool(items),
@@ -3722,23 +4253,39 @@ def _build_daban_from_em(
             "day": day,
             "realtime": True,
             "source": "eastmoney",
+            "rule": rule,
         }
 
     tabs = {
-        "auction": _tab("auction", "竞价/早封", auction_src),
-        "near_limit": _tab("near_limit", "即将涨停", near_src),
-        "wind": _tab("wind", "风向标", wind_src),
-        "limit_up": _tab("limit_up", "涨停", limit_up_src),
-        "broken": _tab("broken", "炸板", broken_src),
+        "auction": _tab("auction", "竞价", auction_src, "early_seal+prevzt_high_open"),
+        "near_limit": _tab("near_limit", "即将涨停", near_src, "gap_to_limit+speed+qs/zb"),
+        "wind": _tab("wind", "风向标", wind_src, "lianban+theme_leader+near"),
+        "limit_up": _tab("limit_up", "涨停", limit_up_src, "fund>lbc>fbt>amount"),
+        "broken": _tab("broken", "炸板", broken_src, "amount*early*zbc"),
+        "natural": _tab("natural", "自然涨停", natural_src, "non_yizi_prefer_first"),
+        "limit_down": _tab("limit_down", "跌停", limit_down_src, "dt_fund_amount"),
+        "new_stock": _tab("new_stock", "新股", new_stock_src, "cx_ods_amount"),
+        "once_down": _tab("once_down", "曾跌停", once_src, "intraday_low_limit_dn"),
     }
     any_ok = any(t.get("ok") for t in tabs.values())
     return {
         "ok": any_ok,
         "source": "eastmoney",
+        "ruleset": "em_daban_v2",
         "day": day,
         "tabs": tabs,
-        "tab_order": ["auction", "near_limit", "wind", "limit_up", "broken"],
-        "note": "东财主题池/强势池近似（竞价=早封涨停；即将=强势未封；风向标=连板+强势）",
+        "tab_order": [
+            "auction",
+            "near_limit",
+            "wind",
+            "limit_up",
+            "broken",
+            "natural",
+            "limit_down",
+            "new_stock",
+            "once_down",
+        ],
+        "note": "东财公开主题池+行情列表自研规则（非第三方同源）；竞价/风向/即将为近似口径",
     }
 
 
@@ -4259,12 +4806,19 @@ def _market_overview_fresh(cache_key: str, refresh: bool = False) -> dict[str, A
     day_key = _now().strftime("%Y%m%d")
     day_iso = _now().strftime("%Y-%m-%d")
     zt_pool, dt_pool, zb_pool, qs_pool = [], [], [], []
+    cx_pool, yzt_pool = [], []
+    clist_up, clist_speed, clist_down = [], [], []
 
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        f_zt = pool.submit(_fetch_topic_pool, EM_ZT_HOSTS, day_key, 500, "amount:desc")
-        f_dt = pool.submit(_fetch_topic_pool, EM_DT_HOSTS, day_key, 200, "amount:desc")
+    with ThreadPoolExecutor(max_workers=9) as pool:
+        f_zt = pool.submit(_fetch_topic_pool, EM_ZT_HOSTS, day_key, 500, "fund:desc")
+        f_dt = pool.submit(_fetch_topic_pool, EM_DT_HOSTS, day_key, 200, "fund:desc")
         f_zb = pool.submit(_fetch_topic_pool, EM_ZB_HOSTS, day_key, 200, "amount:desc")
         f_qs = pool.submit(_fetch_topic_pool, EM_QS_HOSTS, day_key, 200, "zdp:desc")
+        f_cx = pool.submit(_fetch_topic_pool, EM_CX_HOSTS, day_key, 200, "ods:asc")
+        f_yzt = pool.submit(_fetch_topic_pool, EM_YZT_HOSTS, day_key, 200, "zs:desc")
+        f_cu = pool.submit(_em_clist_scan, pagesize=200, sort="f3:desc")
+        f_cs = pool.submit(_em_clist_scan, pagesize=120, sort="f22:desc")
+        f_cd = pool.submit(_em_clist_scan, pagesize=200, sort="f3:asc")
         try:
             zt_pool = f_zt.result()
         except Exception as e:
@@ -4281,12 +4835,47 @@ def _market_overview_fresh(cache_key: str, refresh: bool = False) -> dict[str, A
             qs_pool = f_qs.result()
         except Exception as e:
             log.warning("qs pool: %s", e)
+        try:
+            cx_pool = f_cx.result()
+        except Exception as e:
+            log.warning("cx pool: %s", e)
+        if not cx_pool:
+            try:
+                cx_pool = _fetch_topic_pool(EM_CX_HOSTS_ALT, day_key, 200, "ods:asc")
+            except Exception as e:
+                log.warning("cx alt pool: %s", e)
+        try:
+            yzt_pool = f_yzt.result()
+        except Exception as e:
+            log.warning("yzt pool: %s", e)
+        try:
+            clist_up = f_cu.result() or []
+        except Exception as e:
+            log.warning("clist up: %s", e)
+        try:
+            clist_speed = f_cs.result() or []
+        except Exception as e:
+            log.warning("clist speed: %s", e)
+        try:
+            clist_down = f_cd.result() or []
+        except Exception as e:
+            log.warning("clist down: %s", e)
 
     zt = _pool_stats(zt_pool)
     dt = _pool_stats(dt_pool)
     zb = _pool_stats(zb_pool)
     daban_bundle = _build_daban_from_em(
-        zt_pool, zb_pool, qs_pool, limit=15, day=day_iso
+        zt_pool,
+        zb_pool,
+        qs_pool,
+        dt_pool=dt_pool,
+        cx_pool=cx_pool,
+        yzt_pool=yzt_pool,
+        clist_up=clist_up,
+        clist_speed=clist_speed,
+        clist_down=clist_down,
+        limit=15,
+        day=day_iso,
     )
     strength = _compute_sentiment_strength(zt, zb, sh, sz, day=day_iso)
 
@@ -4374,7 +4963,7 @@ def _market_overview_fresh(cache_key: str, refresh: bool = False) -> dict[str, A
                 "st_limit_up": zt.get("st_count", 0),
                 "st_limit_down": dt.get("st_count", 0),
             },
-            "note": "涨停/跌停/炸板统计=东财主题池（剔 ST）；下方打板明细=东财主题池/强势池自研近似",
+            "note": "涨停/跌停/炸板统计=东财主题池（剔 ST）；下方打板明细=东财主题池+行情列表自研规则 v2",
         },
         "daban": daban_bundle if isinstance(daban_bundle, dict) else {"ok": False, "tabs": {}},
         "structure": fund_structure.market_structure(refresh=refresh),

@@ -3785,6 +3785,12 @@ def _pool_item_to_daban(x: dict[str, Any], tab: str) -> Optional[dict[str, Any]]
             board_text = f"自然{limit_times}板"
     elif tab == "once_down":
         board_text = str(x.get("once_tag") or "曾跌停")
+    elif tab == "yizi":
+        board_text = "一字"
+        if limit_times and limit_times >= 2:
+            board_text = f"一字{limit_times}板"
+    elif tab == "lianban":
+        board_text = f"{limit_times}板" if limit_times >= 2 else "连板"
     elif limit_times and limit_times >= 2:
         board_text = f"{limit_times}板"
     elif tab == "limit_up":
@@ -4256,12 +4262,30 @@ def _build_daban_from_em(
             "rule": rule,
         }
 
+    # ---------- 一字板 / 连板（从涨停池拆出，供打板观察） ----------
+    yizi_src = sorted(
+        [z for z in non_st_zt if _is_yizi_row(z)],
+        key=lambda z: (_lbc_of(z), _fund_of(z), _amount_of(z)),
+        reverse=True,
+    )[:lim]
+    for z in yizi_src:
+        z["_rule"] = "yizi_fbt_zbc0"
+    lianban_src = sorted(
+        [z for z in non_st_zt if _lbc_of(z) >= 2],
+        key=lambda z: (_lbc_of(z), _fund_of(z), _amount_of(z)),
+        reverse=True,
+    )[:lim]
+    for z in lianban_src:
+        z["_rule"] = "lianban_ge2"
+
     tabs = {
         "auction": _tab("auction", "竞价", auction_src, "early_seal+prevzt_high_open"),
         "near_limit": _tab("near_limit", "即将涨停", near_src, "gap_to_limit+speed+qs/zb"),
         "wind": _tab("wind", "风向标", wind_src, "lianban+theme_leader+near"),
         "limit_up": _tab("limit_up", "涨停", limit_up_src, "fund>lbc>fbt>amount"),
         "broken": _tab("broken", "炸板", broken_src, "amount*early*zbc"),
+        "yizi": _tab("yizi", "一字", yizi_src, "early_seal_never_open"),
+        "lianban": _tab("lianban", "连板", lianban_src, "lbc_ge2"),
         "natural": _tab("natural", "自然涨停", natural_src, "non_yizi_prefer_first"),
         "limit_down": _tab("limit_down", "跌停", limit_down_src, "dt_fund_amount"),
         "new_stock": _tab("new_stock", "新股", new_stock_src, "cx_ods_amount"),
@@ -4280,6 +4304,8 @@ def _build_daban_from_em(
             "wind",
             "limit_up",
             "broken",
+            "yizi",
+            "lianban",
             "natural",
             "limit_down",
             "new_stock",
@@ -4522,6 +4548,28 @@ def _build_vs_prev_pace(
         }
     )
     return out
+
+
+def _prev_trade_day_key(day_key: str, lookback: int = 12) -> Optional[str]:
+    """Find a previous calendar day with non-empty ZT pool (proxy for trade day)."""
+    try:
+        base = datetime.strptime(str(day_key)[:8], "%Y%m%d")
+    except Exception:
+        return None
+    for i in range(1, max(2, int(lookback)) + 1):
+        d = (base - timedelta(days=i)).strftime("%Y%m%d")
+        try:
+            pool = _fetch_topic_pool(EM_ZT_HOSTS, d, 5, "fund:desc")
+            if pool:
+                return d
+        except Exception:
+            continue
+    # fallback calendar previous weekday
+    for i in range(1, 8):
+        d = base - timedelta(days=i)
+        if d.weekday() < 5:
+            return d.strftime("%Y%m%d")
+    return None
 
 
 def market_overview(refresh: bool = False) -> dict[str, Any]:
@@ -4864,6 +4912,45 @@ def _market_overview_fresh(cache_key: str, refresh: bool = False) -> dict[str, A
     zt = _pool_stats(zt_pool)
     dt = _pool_stats(dt_pool)
     zb = _pool_stats(zb_pool)
+
+    # 昨日涨停/跌停/炸板家数（用于 今日/昨日 展示）
+    prev_zt_n = prev_dt_n = prev_zb_n = None
+    prev_day_key = None
+    try:
+        prev_day_key = _prev_trade_day_key(day_key)
+        if prev_day_key:
+            with ThreadPoolExecutor(max_workers=3) as ppool:
+                p_zt = ppool.submit(_fetch_topic_pool, EM_ZT_HOSTS, prev_day_key, 500, "fund:desc")
+                p_dt = ppool.submit(_fetch_topic_pool, EM_DT_HOSTS, prev_day_key, 200, "fund:desc")
+                p_zb = ppool.submit(_fetch_topic_pool, EM_ZB_HOSTS, prev_day_key, 200, "amount:desc")
+                try:
+                    prev_zt_n = _pool_stats(p_zt.result() or []).get("count")
+                except Exception as e:
+                    log.warning("prev zt: %s", e)
+                try:
+                    prev_dt_n = _pool_stats(p_dt.result() or []).get("count")
+                except Exception as e:
+                    log.warning("prev dt: %s", e)
+                try:
+                    prev_zb_n = _pool_stats(p_zb.result() or []).get("count")
+                except Exception as e:
+                    log.warning("prev zb: %s", e)
+    except Exception as e:
+        log.warning("prev day pools: %s", e)
+
+    if isinstance(zt, dict):
+        zt = dict(zt)
+        zt["prev_count"] = prev_zt_n
+        zt["prev_day"] = prev_day_key
+    if isinstance(dt, dict):
+        dt = dict(dt)
+        dt["prev_count"] = prev_dt_n
+        dt["prev_day"] = prev_day_key
+    if isinstance(zb, dict):
+        zb = dict(zb)
+        zb["prev_count"] = prev_zb_n
+        zb["prev_day"] = prev_day_key
+
     daban_bundle = _build_daban_from_em(
         zt_pool,
         zb_pool,
@@ -4962,6 +5049,10 @@ def _market_overview_fresh(cache_key: str, refresh: bool = False) -> dict[str, A
                 "lb2": zt.get("lb2_count", 0),
                 "st_limit_up": zt.get("st_count", 0),
                 "st_limit_down": dt.get("st_count", 0),
+                "limit_up_prev": zt.get("prev_count"),
+                "limit_down_prev": dt.get("prev_count"),
+                "broken_prev": zb.get("prev_count"),
+                "prev_day": prev_day_key,
             },
             "note": "涨停/跌停/炸板统计=东财主题池（剔 ST）；下方打板明细=东财主题池+行情列表自研规则 v2",
         },

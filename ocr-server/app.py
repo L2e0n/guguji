@@ -30,6 +30,7 @@ import qdii_service
 import qdii_radar
 import sector_flow
 import dark_flow
+import history_store
 import fund_structure
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -918,16 +919,25 @@ def sector_dual():
         top = 20
     primary_only = request.args.get("primary_only", "1").lower() not in ("0", "false", "no")
     refresh = request.args.get("refresh", "").lower() in ("1", "true", "yes")
+    day = (request.args.get("day") or request.args.get("date") or "").strip()
     try:
-        return jsonify(
-            sector_flow.dual_rank(
-                board_type=board_type,
-                period=period,
-                top=top,
-                primary_only=primary_only,
-                refresh=refresh,
-            )
+        if day:
+            hit = history_store.get("sector_dual", day, skey=f"{board_type}:{period}")
+            if hit:
+                return jsonify(hit)
+            return jsonify({"ok": False, "error": f"无历史快照 {day}", "day": day, "history": True}), 404
+        result = sector_flow.dual_rank(
+            board_type=board_type,
+            period=period,
+            top=top,
+            primary_only=primary_only,
+            refresh=refresh,
         )
+        try:
+            history_store.save_sector_dual(result)
+        except Exception as he:
+            log.warning("save sector dual history: %s", he)
+        return jsonify(result)
     except ValueError as e:
         return jsonify({"ok": False, "error": str(e)}), 400
     except Exception as e:
@@ -970,10 +980,24 @@ def sector_intraday():
 
 @app.route("/api/sector/market", methods=["GET"])
 def sector_market():
-    """?????/???? + ?????(?ST)."""
+    """量能/涨跌停/打板/宽基结构；支持 ?day=YYYY-MM-DD 读历史快照。"""
     refresh = request.args.get("refresh", "").lower() in ("1", "true", "yes")
+    day = (request.args.get("day") or request.args.get("date") or "").strip()
     try:
-        return jsonify(sector_flow.market_overview(refresh=refresh))
+        if day:
+            hit = history_store.get("market", day, skey="overview")
+            if hit:
+                return jsonify(hit)
+            return jsonify({"ok": False, "error": f"无历史快照 {day}", "day": day, "history": True}), 404
+        result = sector_flow.market_overview(refresh=refresh)
+        try:
+            history_store.save_market(result)
+            struct = result.get("structure") if isinstance(result, dict) else None
+            if isinstance(struct, dict) and struct.get("ok"):
+                history_store.save_structure(struct)
+        except Exception as he:
+            log.warning("save market history: %s", he)
+        return jsonify(result)
     except Exception as e:
         log.warning("sector market failed: %s", e)
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -1016,12 +1040,24 @@ def dark_health():
 
 @app.route("/api/dark/rank", methods=["GET"])
 def dark_rank():
+    """暗盘/明盘榜；支持 ?day=YYYY-MM-DD 读历史快照。"""
     try:
         sort = request.args.get("sort", "dark_in")
         limit = request.args.get("limit", 30)
         page = request.args.get("page", 1)
         refresh = request.args.get("refresh", "0") in ("1", "true", "True", "yes")
-        return jsonify(dark_flow.rank(sort=sort, limit=limit, page=page, refresh=refresh))
+        day = (request.args.get("day") or request.args.get("date") or "").strip()
+        if day:
+            hit = history_store.get("dark_rank", day, skey=str(sort or "dark_in"))
+            if hit:
+                return jsonify(hit)
+            return jsonify({"ok": False, "error": f"无历史快照 {day}", "day": day, "history": True}), 404
+        result = dark_flow.rank(sort=sort, limit=limit, page=page, refresh=refresh)
+        try:
+            history_store.save_dark_rank(result)
+        except Exception as he:
+            log.warning("save dark rank history: %s", he)
+        return jsonify(result)
     except Exception as e:
         log.warning("dark rank failed: %s", e)
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -1039,6 +1075,93 @@ def dark_query():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+
+
+
+
+@app.route("/api/sector/history/days", methods=["GET"])
+def sector_history_days():
+    """List snapshot days for sector_dual / market / structure.
+    Query: kind=sector_dual|market|structure (default sector_dual), limit=120
+    """
+    kind = (request.args.get("kind") or "sector_dual").strip()
+    if kind not in ("sector_dual", "market", "structure", "dark_rank"):
+        kind = "sector_dual"
+    try:
+        limit = int(request.args.get("limit", 120))
+    except ValueError:
+        limit = 120
+    try:
+        days = history_store.list_days(kind, limit=limit)
+        return jsonify({
+            "ok": True,
+            "kind": kind,
+            "start": history_store.HISTORY_START,
+            "days": days,
+            "count": len(days),
+        })
+    except Exception as e:
+        log.warning("sector history days failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/dark/history/days", methods=["GET"])
+def dark_history_days():
+    """List snapshot days for dark_rank."""
+    try:
+        limit = int(request.args.get("limit", 120))
+    except ValueError:
+        limit = 120
+    try:
+        days = history_store.list_days("dark_rank", limit=limit)
+        return jsonify({
+            "ok": True,
+            "kind": "dark_rank",
+            "start": history_store.HISTORY_START,
+            "days": days,
+            "count": len(days),
+        })
+    except Exception as e:
+        log.warning("dark history days failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/history/days", methods=["GET"])
+def history_days_union():
+    """Union of snapshot days across sector_dual / market / dark_rank."""
+    try:
+        limit = int(request.args.get("limit", 120))
+    except ValueError:
+        limit = 120
+    try:
+        merged = {}
+        for kind in ("sector_dual", "market", "dark_rank", "structure"):
+            for row in history_store.list_days(kind, limit=limit):
+                d = row.get("day")
+                if not d:
+                    continue
+                cur = merged.get(d) or {"day": d, "kinds": [], "asof": None, "updated_at": 0}
+                if row.get("asof") and (not cur["asof"] or str(row["asof"]) > str(cur["asof"])):
+                    cur["asof"] = row.get("asof")
+                try:
+                    u = float(row.get("updated_at") or 0)
+                except (TypeError, ValueError):
+                    u = 0
+                if u >= float(cur.get("updated_at") or 0):
+                    cur["updated_at"] = u
+                if kind not in cur["kinds"]:
+                    cur["kinds"].append(kind)
+                merged[d] = cur
+        days = sorted(merged.values(), key=lambda x: x["day"], reverse=True)[: max(1, min(limit, 366))]
+        return jsonify({
+            "ok": True,
+            "start": history_store.HISTORY_START,
+            "days": days,
+            "count": len(days),
+        })
+    except Exception as e:
+        log.warning("history days union failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.route("/api/stock/fund-profile", methods=["GET"])

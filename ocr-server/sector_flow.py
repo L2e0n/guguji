@@ -22,7 +22,6 @@ from typing import Any, Optional
 import requests
 
 import fund_structure
-import kaipanla
 
 log = logging.getLogger("guguji-sector-flow")
 
@@ -1009,6 +1008,10 @@ EM_ZB_HOSTS = [
     "https://push2ex.eastmoney.com/getTopicZBPool",
     "https://push2exdelay.eastmoney.com/getTopicZBPool",
 ]
+EM_QS_HOSTS = [
+    "https://push2ex.eastmoney.com/getTopicQSPool",
+    "https://push2exdelay.eastmoney.com/getTopicQSPool",
+]
 _MARKET_TTL = 12.0
 
 
@@ -1899,12 +1902,35 @@ def _merge_minute_by_day(
 
 
 def _avg_cum_ratio_curve(
-    by_day: dict[str, list[tuple[str, float]]], exclude_day: str
+    by_day: dict[str, list[tuple[str, float]]],
+    exclude_day: str,
+    max_days: int = 3,
 ) -> dict[int, float]:
-    """Average cumulative volume share by session minute index (completed hist days)."""
+    """Average cumulative volume share by session minute index (completed hist days).
+
+    Prefer the most recent ``max_days`` complete sessions (default 3), aligning with
+    the 3-day same-time baseline used by common market-capacity predictors:
+        predict = cum_today / mean(cum_hist / full_hist)
+    """
+    # newest complete days first
+    complete_days: list[str] = []
+    for day, pts in sorted(by_day.items(), reverse=True):
+        if day == exclude_day:
+            continue
+        if len(pts) < 200:
+            continue
+        total = sum(a for _, a in pts)
+        if total > 0:
+            complete_days.append(day)
+        if max_days and len(complete_days) >= int(max_days):
+            break
+    use_set = set(complete_days) if complete_days else None
+
     buckets: dict[int, list[float]] = {}
     for day, pts in by_day.items():
         if day == exclude_day:
+            continue
+        if use_set is not None and day not in use_set:
             continue
         if len(pts) < 200:
             continue
@@ -1933,6 +1959,79 @@ def _avg_cum_ratio_curve(
         if vals:
             curve[idx] = sum(vals) / len(vals)
     return curve
+
+
+def _abs_3d_baseline(
+    by_day: dict[str, list[tuple[str, float]]],
+    exclude_day: str,
+    max_days: int = 3,
+) -> tuple[dict[int, float], Optional[float], int]:
+    """Absolute 3-day same-time cumulative baseline.
+
+    Returns (s3_cum_by_idx, s3_full, n_days) in yuan.
+    Formula mirror:
+        predict = today_cum * s3_full / s3_cum[now_idx]
+    """
+    day_cums: list[tuple[str, dict[int, float], float]] = []
+    for day, pts in sorted(by_day.items(), reverse=True):
+        if day == exclude_day:
+            continue
+        if len(pts) < 200:
+            continue
+        cum_map = _minute_cum_from_pts(pts)
+        if len(cum_map) < 180:
+            continue
+        full = float(max(cum_map.values())) if cum_map else 0.0
+        if full <= 0:
+            continue
+        day_cums.append((day, cum_map, full))
+        if len(day_cums) >= int(max_days):
+            break
+    if not day_cums:
+        return {}, None, 0
+    all_idx = set()
+    for _, cm, _ in day_cums:
+        all_idx |= set(cm.keys())
+    s3_cum: dict[int, float] = {}
+    for i in sorted(all_idx):
+        vals = []
+        for _, cm, _ in day_cums:
+            prev = [k for k in cm if k <= i]
+            if prev:
+                vals.append(float(cm[max(prev)]))
+        if vals:
+            s3_cum[i] = sum(vals) / len(vals)
+    s3_full = sum(f for _, _, f in day_cums) / len(day_cums)
+    return s3_cum, float(s3_full), len(day_cums)
+
+
+def _predict_by_abs_3d(
+    amount: Optional[float],
+    hhmm: str,
+    s3_cum: dict[int, float],
+    s3_full: Optional[float],
+    progress: float,
+) -> tuple[Optional[float], str, Optional[float]]:
+    """predict = amount * s3_full / s3_cum[t]  (3-day absolute same-time)."""
+    if amount is None or s3_full is None or s3_full <= 0 or not s3_cum:
+        return None, "none", None
+    if progress >= 0.995:
+        return float(amount), "closed", 1.0
+    idx = _hhmm_to_session_idx(hhmm)
+    if idx is None:
+        return None, "unavailable", None
+    prev = [k for k in s3_cum if k <= idx]
+    if not prev:
+        return None, "unavailable", None
+    base = float(s3_cum[max(prev)])
+    if base <= 0:
+        return None, "unavailable", None
+    ratio = base / float(s3_full)
+    # Allow very early open (09:30 cum share can be < 1%); only guard zero/noise.
+    if ratio < 0.002:
+        return None, "unavailable", None
+    ratio = max(0.002, min(0.999, ratio))
+    return float(amount) / ratio, "profile_3d_same_time", ratio
 
 
 def _ratio_at(curve: dict[int, float], hhmm: str) -> Optional[float]:
@@ -3173,14 +3272,14 @@ def _get_volume_profiles(today: str) -> dict[str, Any]:
         prev_total = float(prev_hs) + (float(prev_bj) if prev_bj is not None and float(prev_bj) > 0 else 0.0)
 
     method_label = {
-        "eastmoney": "profile",
-        "eastmoney+tencent": "profile",
-        "tencent": "profile_tencent",
+        "eastmoney": "profile_3d",
+        "eastmoney+tencent": "profile_3d",
+        "tencent": "profile_3d_tencent",
         "day_archive": "profile_archive",
         "yixin": "profile_yixin",
         "disk_cache": "profile_cache",
         "builtin": "profile_builtin",
-    }.get(profile_source, "profile")
+    }.get(profile_source, "profile_3d")
 
     # today's realized minute path (for intraday self-calibration)
     today_cum_sh = _minute_cum_from_pts(sh_by.get(today) or [])
@@ -3193,6 +3292,15 @@ def _get_volume_profiles(today: str) -> dict[str, Any]:
             today_cum_hs[i] = float(today_cum_sh.get(i) or 0.0) + float(today_cum_sz.get(i) or 0.0)
     else:
         today_cum_hs = {}
+
+    # Absolute 3-day same-time baseline on HS (SH+SZ minute paths)
+    hs_by_merged: dict[str, list[tuple[str, float]]] = {}
+    for day in set(sh_by) | set(sz_by):
+        sh_pts = {t: a for t, a in (sh_by.get(day) or [])}
+        sz_pts = {t: a for t, a in (sz_by.get(day) or [])}
+        times = sorted(set(sh_pts) | set(sz_pts), key=lambda t: _hhmm_to_session_idx(t) or 0)
+        hs_by_merged[day] = [(t, float(sh_pts.get(t) or 0.0) + float(sz_pts.get(t) or 0.0)) for t in times]
+    hs_s3_cum, hs_s3_full, hs_s3_days = _abs_3d_baseline(hs_by_merged, exclude_day=today, max_days=3)
 
     payload: dict[str, Any] = {
         "sh": sh_curve,
@@ -3213,6 +3321,9 @@ def _get_volume_profiles(today: str) -> dict[str, Any]:
         "curve_points": len(hs_curve),
         "method_label": method_label,
         "today_path_points": len(today_cum_hs),
+        "hs_s3_cum": hs_s3_cum,
+        "hs_s3_full": hs_s3_full,
+        "hs_s3_days": hs_s3_days,
     }
 
     ok_curve = len(hs_curve) >= 30
@@ -3395,6 +3506,240 @@ def _pool_stats(pool: list[dict[str, Any]]) -> dict[str, Any]:
         "lb2_top": _top(sorted(lb2, key=lambda z: int(z.get("lbc") or z.get("days") or 0), reverse=True), 8),
     }
 
+
+def _max_lianban(pool_stats: dict[str, Any]) -> int:
+    mx = 1
+    for row in (pool_stats.get("lb2_top") or []) + (pool_stats.get("top") or []):
+        if not isinstance(row, dict):
+            continue
+        for k in ("board_count", "lbc", "days"):
+            v = row.get(k)
+            try:
+                if v is not None:
+                    mx = max(mx, int(v))
+            except (TypeError, ValueError):
+                continue
+    return max(1, mx)
+
+
+def _compute_sentiment_strength(
+    zt: dict[str, Any],
+    zb: dict[str, Any],
+    sh: dict[str, Any],
+    sz: dict[str, Any],
+    day: Optional[str] = None,
+) -> dict[str, Any]:
+    """Self-built market sentiment score 0-100 (Eastmoney inputs only).
+
+    Not claimed to equal any third-party black-box score. Tip thresholds 25/75
+    are conventional short-term emotion bands used for UI guidance only.
+    """
+    zt_n = int(zt.get("count") or 0)
+    zb_n = int(zb.get("count") or 0)
+    max_lb = _max_lianban(zt)
+    seal = (zt_n / (zt_n + zb_n)) if (zt_n + zb_n) > 0 else 0.5
+    up = int(sh.get("up_count") or 0) + int(sz.get("up_count") or 0)
+    down = int(sh.get("down_count") or 0) + int(sz.get("down_count") or 0)
+    breadth = (up / (up + down)) if (up + down) > 0 else 0.5
+
+    s_zt = min(100.0, zt_n / 1.2)  # ~120 limit-ups -> 100
+    s_seal = seal * 100.0
+    s_h = min(100.0, max_lb / 10.0 * 100.0)
+    s_b = breadth * 100.0
+    strong = 0.35 * s_zt + 0.30 * s_seal + 0.20 * s_h + 0.15 * s_b
+    strong = max(0.0, min(100.0, float(strong)))
+
+    if strong >= 75:
+        band, band_label = "high", "偏热"
+    elif strong <= 25:
+        band, band_label = "low", "偏冷"
+    else:
+        band, band_label = "mid", "中性"
+
+    tip = (
+        "温馨提示：情绪指标过高（75），短期有释放亏钱效应的风险；"
+        "情绪指标过低（25），短线有反弹回暖需求；提示仅供参考"
+    )
+    return {
+        "ok": True,
+        "source": "self",
+        "strong": round(strong, 1),
+        "ztjs": zt_n,
+        "df_num": zb_n,  # 炸板家数（自研口径）
+        "lbgd": max_lb,
+        "seal_rate": round(seal, 4),
+        "breadth": round(breadth, 4),
+        "components": {
+            "zt": round(s_zt, 2),
+            "seal": round(s_seal, 2),
+            "height": round(s_h, 2),
+            "breadth": round(s_b, 2),
+            "weights": {"zt": 0.35, "seal": 0.30, "height": 0.20, "breadth": 0.15},
+        },
+        "band": band,
+        "band_label": band_label,
+        "tip": tip,
+        "label": "综合强度",
+        "day": day,
+        "note": "自研情绪分（东财涨停/炸板/涨跌家数），参考阈值 25/75",
+    }
+
+
+def _pool_item_to_daban(x: dict[str, Any], tab: str) -> Optional[dict[str, Any]]:
+    if not isinstance(x, dict):
+        return None
+    code = str(x.get("c") or "").strip()
+    name = str(x.get("n") or "").strip()
+    if not code or not name:
+        return None
+    if _is_st_name(name):
+        return None
+    lbc = x.get("lbc")
+    if lbc is None and isinstance(x.get("zttj"), dict):
+        lbc = x["zttj"].get("ct") or x["zttj"].get("days")
+    try:
+        limit_times = int(lbc) if lbc is not None else None
+    except (TypeError, ValueError):
+        limit_times = None
+    board_text = None
+    if limit_times and limit_times >= 2:
+        board_text = f"{limit_times}板"
+    elif tab == "broken":
+        board_text = "炸板"
+    elif tab == "auction":
+        board_text = "早封"
+    elif tab == "near_limit":
+        board_text = "强势"
+    hybk = str(x.get("hybk") or "").strip() or None
+    chg = _num(x.get("zdp"))
+    # 涨停池涨跌幅接近 0 不展示
+    if tab == "limit_up" and chg is not None and abs(float(chg)) < 1e-6:
+        chg = None
+    return {
+        "code": code,
+        "name": name,
+        "change_pct": chg,
+        "board_text": board_text,
+        "limit_times": limit_times,
+        "theme": hybk,
+        "industry": hybk,
+        "tab": tab,
+        "amount_yi": _yi(_num(x.get("amount"))),
+        "fbt": x.get("fbt"),
+        "zbc": x.get("zbc"),
+    }
+
+
+def _fbt_sort_key(x: dict[str, Any]) -> int:
+    try:
+        return int(x.get("fbt") if x.get("fbt") is not None else 999999)
+    except (TypeError, ValueError):
+        return 999999
+
+
+def _build_daban_from_em(
+    zt_pool: list[dict[str, Any]],
+    zb_pool: list[dict[str, Any]],
+    qs_pool: list[dict[str, Any]],
+    *,
+    limit: int = 15,
+    day: Optional[str] = None,
+) -> dict[str, Any]:
+    """Build daban tabs from Eastmoney topic pools (no third-party board APIs)."""
+    lim = max(5, min(int(limit or 15), 40))
+    non_st_zt = [x for x in (zt_pool or []) if not _is_st_name(x.get("n") or "")]
+    non_st_zb = [x for x in (zb_pool or []) if not _is_st_name(x.get("n") or "")]
+    non_st_qs = [x for x in (qs_pool or []) if not _is_st_name(x.get("n") or "")]
+    zt_codes = {str(x.get("c") or "") for x in non_st_zt}
+
+    # 竞价/早封：首封时间靠近集合竞价结束
+    auction_src = sorted(
+        [x for x in non_st_zt if _fbt_sort_key(x) <= 93030],
+        key=_fbt_sort_key,
+    )
+    if len(auction_src) < 5:
+        # 补最早封板
+        auction_src = sorted(non_st_zt, key=_fbt_sort_key)[: max(lim, 10)]
+
+    # 即将涨停：强势池中尚未在涨停池、且涨幅靠前
+    near_src = []
+    for x in sorted(non_st_qs, key=lambda z: float(_num(z.get("zdp")) or -999), reverse=True):
+        code = str(x.get("c") or "")
+        if code in zt_codes:
+            continue
+        near_src.append(x)
+        if len(near_src) >= lim:
+            break
+    if len(near_src) < 5:
+        # fallback：涨停池中炸板次数>0 或最晚封
+        near_src = sorted(
+            non_st_zt,
+            key=lambda z: float(_num(z.get("zdp")) or 0),
+            reverse=True,
+        )[:lim]
+
+    # 涨停：成交额排序
+    limit_up_src = sorted(
+        non_st_zt,
+        key=lambda z: float(_num(z.get("amount")) or 0),
+        reverse=True,
+    )[:lim]
+
+    # 炸板
+    broken_src = sorted(
+        non_st_zb,
+        key=lambda z: float(_num(z.get("amount")) or 0),
+        reverse=True,
+    )[:lim]
+
+    # 风向标：连板高度优先 + 强势池高位
+    wind_src = sorted(
+        non_st_zt,
+        key=lambda z: (
+            int(z.get("lbc") or (z.get("zttj") or {}).get("ct") or 0),
+            float(_num(z.get("amount")) or 0),
+        ),
+        reverse=True,
+    )[: max(8, lim // 2)]
+    for x in near_src:
+        if str(x.get("c") or "") not in {str(y.get("c") or "") for y in wind_src}:
+            wind_src.append(x)
+        if len(wind_src) >= lim:
+            break
+
+    def _tab(key: str, label: str, src: list) -> dict[str, Any]:
+        items = []
+        for x in src[:lim]:
+            it = _pool_item_to_daban(x, key)
+            if it:
+                items.append(it)
+        return {
+            "ok": bool(items),
+            "key": key,
+            "label": label,
+            "items": items,
+            "count": len(items),
+            "day": day,
+            "realtime": True,
+            "source": "eastmoney",
+        }
+
+    tabs = {
+        "auction": _tab("auction", "竞价/早封", auction_src),
+        "near_limit": _tab("near_limit", "即将涨停", near_src),
+        "wind": _tab("wind", "风向标", wind_src),
+        "limit_up": _tab("limit_up", "涨停", limit_up_src),
+        "broken": _tab("broken", "炸板", broken_src),
+    }
+    any_ok = any(t.get("ok") for t in tabs.values())
+    return {
+        "ok": any_ok,
+        "source": "eastmoney",
+        "day": day,
+        "tabs": tabs,
+        "tab_order": ["auction", "near_limit", "wind", "limit_up", "broken"],
+        "note": "东财主题池/强势池近似（竞价=早封涨停；即将=强势未封；风向标=连板+强势）",
+    }
 
 
 def _session_idx_to_hhmm(idx: int) -> str:
@@ -3810,6 +4155,33 @@ def _market_overview_fresh(cache_key: str, refresh: bool = False) -> dict[str, A
     if not self_cal_meta.get("self_cal") and _tot_meta.get("self_cal"):
         self_cal_meta = _tot_meta
 
+    # Prefer absolute 3-day same-time baseline when available (formula:
+    # predict = cum * s3_full / s3_cum[t]). Blend lightly with path self-cal.
+    s3_cum = prof.get("hs_s3_cum") or {}
+    s3_full = prof.get("hs_s3_full")
+    s3_n = int(prof.get("hs_s3_days") or 0)
+    if s3_n >= 2 and s3_cum and s3_full:
+        pred3, m3, r3 = _predict_by_abs_3d(hs_amt, now_hhmm, s3_cum, float(s3_full), p)
+        if pred3 is not None:
+            if hs_pred is not None and self_cal_meta.get("self_cal") and p >= 0.12:
+                w = float(self_cal_meta.get("weight") or 0.25)
+                w = max(0.0, min(0.55, w))
+                hs_pred = (1.0 - w) * float(pred3) + w * float(hs_pred)
+                hs_method = "profile_3d_selfcal"
+            else:
+                hs_pred, hs_method = float(pred3), m3
+            hs_ratio = r3
+        pred3t, m3t, r3t = _predict_by_abs_3d(total_amt, now_hhmm, s3_cum, float(s3_full), p)
+        if pred3t is not None:
+            if total_pred is not None and _tot_meta.get("self_cal") and p >= 0.12:
+                w = float(_tot_meta.get("weight") or 0.25)
+                w = max(0.0, min(0.55, w))
+                total_pred = (1.0 - w) * float(pred3t) + w * float(total_pred)
+                total_method = "profile_3d_selfcal"
+            else:
+                total_pred, total_method = float(pred3t), m3t
+            total_ratio = r3t
+
     # vs_prev: align with media HS+BJ total (SH+SZ+BJ50)
     # intraday = full-day predict(total) vs previous complete day; after close use actual total
     prev_base = prev_total if prev_total is not None else prev_hs
@@ -3885,16 +4257,14 @@ def _market_overview_fresh(cache_key: str, refresh: bool = False) -> dict[str, A
         vs_prev_pace = {"ok": False, "error": str(e), "points": []}
 
     day_key = _now().strftime("%Y%m%d")
-    zt_pool, dt_pool, zb_pool = [], [], []
-    kpl_bundle: dict[str, Any] = {"ok": False}
-    daban_bundle: dict[str, Any] = {"ok": False}
+    day_iso = _now().strftime("%Y-%m-%d")
+    zt_pool, dt_pool, zb_pool, qs_pool = [], [], [], []
 
-    with ThreadPoolExecutor(max_workers=5) as pool:
+    with ThreadPoolExecutor(max_workers=4) as pool:
         f_zt = pool.submit(_fetch_topic_pool, EM_ZT_HOSTS, day_key, 500, "amount:desc")
         f_dt = pool.submit(_fetch_topic_pool, EM_DT_HOSTS, day_key, 200, "amount:desc")
         f_zb = pool.submit(_fetch_topic_pool, EM_ZB_HOSTS, day_key, 200, "amount:desc")
-        f_kpl = pool.submit(kaipanla.fetch_volume_and_strength)
-        f_daban = pool.submit(kaipanla.fetch_daban_bundle, limit=15)
+        f_qs = pool.submit(_fetch_topic_pool, EM_QS_HOSTS, day_key, 200, "zdp:desc")
         try:
             zt_pool = f_zt.result()
         except Exception as e:
@@ -3908,114 +4278,36 @@ def _market_overview_fresh(cache_key: str, refresh: bool = False) -> dict[str, A
         except Exception as e:
             log.warning("zb pool: %s", e)
         try:
-            kpl_bundle = f_kpl.result() or {"ok": False}
+            qs_pool = f_qs.result()
         except Exception as e:
-            log.warning("kaipanla volume/strength: %s", e)
-            kpl_bundle = {"ok": False, "errors": {"bundle": str(e)}}
-        try:
-            daban_bundle = f_daban.result() or {"ok": False}
-        except Exception as e:
-            log.warning("kaipanla daban: %s", e)
-            daban_bundle = {"ok": False, "error": str(e), "tabs": {}}
+            log.warning("qs pool: %s", e)
 
     zt = _pool_stats(zt_pool)
     dt = _pool_stats(dt_pool)
     zb = _pool_stats(zb_pool)
+    daban_bundle = _build_daban_from_em(
+        zt_pool, zb_pool, qs_pool, limit=15, day=day_iso
+    )
+    strength = _compute_sentiment_strength(zt, zb, sh, sz, day=day_iso)
 
-    # 开盘啦量能主源：仅覆盖合计/沪深总量、预测、vs昨、比值曲线；分市场拆解仍用东财口径
-    kpl_cap = (kpl_bundle or {}).get("capacity") if isinstance(kpl_bundle, dict) else None
-    kpl_strength = (kpl_bundle or {}).get("strength") if isinstance(kpl_bundle, dict) else None
     volume_primary = "eastmoney"
-    em_hs_amt = hs_amt
-    em_hs_pred = hs_pred
-    em_total_amt = total_amt
-    em_total_pred = total_pred
-    em_vs_prev = dict(vs_prev)
-    em_vs_prev_pace = vs_prev_pace
-    em_amount_source = amount_source
-    em_hs_method = hs_method
-    em_total_method = total_method
-    em_hs_ratio = hs_ratio
-    em_total_ratio = total_ratio
-
-    if isinstance(kpl_cap, dict) and kpl_cap.get("ok") and kpl_cap.get("last_yi") is not None:
-        volume_primary = "kaipanla"
-        kpl_last = float(kpl_cap["last_yi"]) * YI  # yuan
-        kpl_pred = kpl_cap.get("predict_amount")
-        if kpl_pred is None and kpl_cap.get("predict_amount_yi") is not None:
-            kpl_pred = float(kpl_cap["predict_amount_yi"]) * YI
-        hs_amt = kpl_last
-        hs_pred = kpl_pred
-        hs_method = "kaipanla_market_capacity"
-        hs_ratio = None
-        # 全市场口径≈沪深合计；京所拆解仍展示，合计 = 开盘啦全市场（不与京所重复叠加）
-        total_amt = kpl_last
-        total_pred = kpl_pred
-        total_method = "kaipanla_market_capacity"
-        total_ratio = None
-        if isinstance(kpl_cap.get("vs_prev"), dict):
-            # 保留东财昨日期等补充字段，金额/方向以开盘啦为准
-            vs_prev = dict(em_vs_prev)
-            vs_prev.update(kpl_cap["vs_prev"])
-            if not vs_prev.get("prev_day"):
-                vs_prev["prev_day"] = (
-                    (kpl_strength or {}).get("day")
-                    or kpl_cap.get("date")
-                    or em_vs_prev.get("prev_day")
-                )
-        if isinstance(kpl_cap.get("vs_prev_pace"), dict) and (kpl_cap["vs_prev_pace"].get("points") or []):
-            vs_prev_pace = dict(kpl_cap["vs_prev_pace"])
-            vs_prev_pace.setdefault("ok", True)
-        amount_source = "kaipanla"
-    else:
-        vs_prev = em_vs_prev
-        vs_prev_pace = em_vs_prev_pace
-
-    strength_block: dict[str, Any]
-    if isinstance(kpl_strength, dict) and kpl_strength.get("ok"):
-        strength_block = {
-            "ok": True,
-            "source": "kaipanla",
-            "strong": kpl_strength.get("strong"),
-            "ztjs": kpl_strength.get("ztjs"),
-            "df_num": kpl_strength.get("df_num"),
-            "lbgd": kpl_strength.get("lbgd"),
-            "day": kpl_strength.get("day"),
-            "tip": kpl_strength.get("tip"),
-            "label": "综合强度",
-        }
-    else:
-        strength_block = {
-            "ok": False,
-            "source": "kaipanla",
-            "strong": None,
-            "error": ((kpl_bundle or {}).get("errors") or {}).get("strength")
-            if isinstance(kpl_bundle, dict)
-            else None,
-            "label": "综合强度",
-        }
-
     sources = ["eastmoney"]
-    if volume_primary == "kaipanla":
-        sources = ["kaipanla", "eastmoney"]
-    if amount_source in ("hithink", "mixed") and "hithink" not in sources:
-        sources.append("hithink")
-    if volume_primary != "kaipanla" and em_amount_source not in ("eastmoney", "none", None):
-        if em_amount_source not in sources and em_amount_source != "mixed":
-            sources.append(str(em_amount_source))
+    if amount_source not in ("eastmoney", "none", None):
+        sources.append(str(amount_source))
 
     result = {
         "ok": True,
-        "source": "+".join(sources),
-        "volume_primary": volume_primary,
-        "asof": _now_iso(),
         "cached": False,
+        "stale": False,
+        "asof": _now_iso(),
+        "source": "+".join(dict.fromkeys(sources)),
+        "volume_primary": volume_primary,
         "session": progress,
-        "strength": strength_block,
+        "strength": strength,
         "volume": {
             "unit": "yi",
-            "sh": {**sh, "board": "shanghai", "label": "上证"},
-            "sz": {**sz, "board": "shenzhen", "label": "深成指"},
+            "sh": sh,
+            "sz": sz,
             "bj": bj,
             "cyb": {**cyb, "board": "chinext", "label": "创业板", "parent": "sz"},
             "kc": {**kc, "board": "star", "label": "科创板", "parent": "sh", "index_note": "科创综指成交额≈科创板"},
@@ -4041,25 +4333,17 @@ def _market_overview_fresh(cache_key: str, refresh: bool = False) -> dict[str, A
                 "source": volume_primary,
             },
             "method": (
-                "实际合计=开盘啦 MarketCapacity 主源，失败回退东财/腾讯/新浪/问财；"
+                "实际合计=东财指数/全市场口径（腾讯/新浪/问财兜底）；"
                 "分市场拆解(上证/科创/深成/创业/北交)=东财既有口径(+备份)；"
-                "预测=开盘啦自带预测量能，失败则历史占比曲线+今日分时自校准"
+                "预测=近3日同时点绝对基准外推(predict=cum*s3_full/s3_cum)，并与今日分时自校准混合"
             ),
             "predict_confidence": _predict_confidence(
                 p,
-                method=(
-                    "kaipanla"
-                    if volume_primary == "kaipanla"
-                    else (total_method if total_method not in (None, "none") else "unavailable")
-                ),
+                method=(total_method if total_method not in (None, "none") else "unavailable"),
             ),
             "profile_minutes": len(hs_curve),
             "profile_source": prof.get("profile_source") or ("eastmoney" if hs_curve else "none"),
-            "prev_source": (
-                "kaipanla"
-                if volume_primary == "kaipanla"
-                else (prof.get("prev_source") or "none")
-            ),
+            "prev_source": prof.get("prev_source") or "none",
             "amount_source": amount_source,
             "volume_primary": volume_primary,
             "asof_hhmm": now_hhmm,
@@ -4069,26 +4353,11 @@ def _market_overview_fresh(cache_key: str, refresh: bool = False) -> dict[str, A
                 "fit_points": self_cal_meta.get("fit_points") or prof.get("today_path_points"),
                 "pred_hist_yi": _yi(self_cal_meta.get("pred_hist")) if self_cal_meta.get("pred_hist") is not None else None,
                 "pred_path_yi": _yi(self_cal_meta.get("pred_path")) if self_cal_meta.get("pred_path") is not None else None,
+                "s3_days": prof.get("hs_s3_days"),
+                "s3_full_yi": _yi(prof.get("hs_s3_full")) if prof.get("hs_s3_full") is not None else None,
             },
             "vs_prev": vs_prev,
             "vs_prev_pace": vs_prev_pace,
-            "kaipanla": {
-                "ok": bool(isinstance(kpl_cap, dict) and kpl_cap.get("ok")),
-                "date": (kpl_cap or {}).get("date") if isinstance(kpl_cap, dict) else None,
-                "last_yi": (kpl_cap or {}).get("last_yi") if isinstance(kpl_cap, dict) else None,
-                "predict_amount_yi": (kpl_cap or {}).get("predict_amount_yi") if isinstance(kpl_cap, dict) else None,
-                "yclnstr": (kpl_cap or {}).get("yclnstr") if isinstance(kpl_cap, dict) else None,
-                "point_count": (kpl_cap or {}).get("point_count") if isinstance(kpl_cap, dict) else 0,
-            },
-            "eastmoney_fallback": {
-                "hs_amount_yi": _yi(em_hs_amt),
-                "hs_predict_amount_yi": _yi(em_hs_pred) if em_hs_pred is not None else None,
-                "total_amount_yi": _yi(em_total_amt),
-                "total_predict_amount_yi": _yi(em_total_pred) if em_total_pred is not None else None,
-                "amount_source": em_amount_source,
-                "hs_method": em_hs_method,
-                "total_method": em_total_method,
-            },
         },
         "limit": {
             "date": day_key,
@@ -4105,7 +4374,7 @@ def _market_overview_fresh(cache_key: str, refresh: bool = False) -> dict[str, A
                 "st_limit_up": zt.get("st_count", 0),
                 "st_limit_down": dt.get("st_count", 0),
             },
-            "note": "涨停/跌停/炸板统计仍来自东财主题池（剔 ST）；下方打板明细来自开盘啦",
+            "note": "涨停/跌停/炸板统计=东财主题池（剔 ST）；下方打板明细=东财主题池/强势池自研近似",
         },
         "daban": daban_bundle if isinstance(daban_bundle, dict) else {"ok": False, "tabs": {}},
         "structure": fund_structure.market_structure(refresh=refresh),

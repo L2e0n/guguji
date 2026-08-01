@@ -18,7 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py qdii_service.py qdii_radar.py qdii_radar_config.json scan_qdii_radar.py sector_flow.py dark_flow.py fund_structure.py kaipanla.py ./
+COPY app.py qdii_service.py qdii_radar.py qdii_radar_config.json scan_qdii_radar.py sector_flow.py dark_flow.py fund_structure.py ./
 
 EXPOSE 5000
 

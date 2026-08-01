@@ -3858,7 +3858,7 @@ def _build_daban_from_em(
     Rules aim to mirror common short-term watchlists (auction / near-limit / wind /
     natural first-board / once limit-down) without third-party proprietary feeds.
     """
-    lim = max(5, min(int(limit or 15), 40))
+    lim = max(5, min(int(limit or 500), 500))
     non_st_zt = [x for x in (zt_pool or []) if not _is_st_name(x.get("n") or "")]
     non_st_zb = [x for x in (zb_pool or []) if not _is_st_name(x.get("n") or "")]
     non_st_qs = [x for x in (qs_pool or []) if not _is_st_name(x.get("n") or "")]
@@ -4436,6 +4436,7 @@ def _build_vs_prev_pace(
                 "implied_yi": round(implied / 1e8, 2),
                 "delta_yi": round(delta_yi, 2),
                 "pace": round(float(pace), 4) if pace is not None else None,
+                "csbl": round((float(pace) - 1.0) * 100.0, 2) if pace is not None else None,
                 "speed_yi_10m": None,
             }
         )
@@ -4961,7 +4962,7 @@ def _market_overview_fresh(cache_key: str, refresh: bool = False) -> dict[str, A
         clist_up=clist_up,
         clist_speed=clist_speed,
         clist_down=clist_down,
-        limit=15,
+        limit=500,
         day=day_iso,
     )
     strength = _compute_sentiment_strength(zt, zb, sh, sz, day=day_iso)

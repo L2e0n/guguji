@@ -371,7 +371,8 @@ new Vue({
 
       const exist = this.fundData[code] || {};
       const quoteDate = (data.gztime || '').substring(5, 10);
-      if (exist.source === '截图' && exist.snapshotDate && (!quoteDate || quoteDate <= exist.snapshotDate)) return;
+      // Screenshot values are only a fallback. A same-day or newer quote may replace them.
+      if (exist.source === '截图' && exist.snapshotDate && quoteDate && quoteDate < exist.snapshotDate) return;
       if (exist.currentTime === '今日已出' || exist.source === '行情') return;
       // 已有估值时，更旧时间戳不覆盖
       if (exist.source === '估值') {
@@ -538,7 +539,6 @@ new Vue({
       const exist = this.fundData[code] || {};
 
       // 行情(东财) > 估值(天天) > 官方(新浪)
-      if (exist.source === '截图') return;
       if (exist.source === '行情' && info.source !== '行情') return;
       if (exist.source === '估值' && info.source === '官方') return;
 
@@ -574,7 +574,7 @@ new Vue({
           this.updateData(code, {
             name: d[0] || '',
             basePrice: bp.toFixed(4),
-            baseDate: '昨净值',
+            baseDate: this.previousTradingDate(navDate) || '昨净值',
             currentPrice: cp.toFixed(4),
             currentTime: navDate ? navDate.substring(5) : '净值',
             gszzl: pct,
@@ -582,6 +582,16 @@ new Vue({
           });
         })
         .catch(() => {});
+    },
+
+    previousTradingDate(dateText) {
+      const match = String(dateText || '').match(/^(\d{4})-(\d{2})-(\d{2})$/);
+      if (!match) return '';
+      const date = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])));
+      do {
+        date.setUTCDate(date.getUTCDate() - 1);
+      } while (date.getUTCDay() === 0 || date.getUTCDay() === 6);
+      return String(date.getUTCMonth() + 1).padStart(2, '0') + '-' + String(date.getUTCDate()).padStart(2, '0');
     },
 
     fetchPingZhongName(code) {
